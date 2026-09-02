@@ -92,6 +92,15 @@ function findFiles(baseDir) {
 function runCommand(command, description) {
   console.log('\n' + description + '...');
   try {
+    // WHY this is suppressed rather than fixed: `command` is a parameter, which is exactly
+    // the shape the rule matches — but every caller in this file passes a STRING LITERAL:
+    //       'npm test 2>&1', 'npm run lint 2>&1' and
+    //       'npm audit --audit-level=high 2>&1'.
+    // process.argv is read only for boolean flags and is never interpolated into a command,
+    // and a repo-wide grep for template-literal or concatenated command strings under
+    // scripts/ returns nothing. Re-read this before adding a caller that builds its command
+    // from input — at that point it becomes a real finding and this line must come out.
+    // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process
     const output = execSync(command, { 
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe']
