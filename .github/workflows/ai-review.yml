@@ -17,11 +17,14 @@
 #       owner as collaborator (verified 2026-09-25). The adversary is OWNER ACCIDENTS and
 #       compromised third-party code (actions, packages), not a malicious contributor.
 #       Hence: base-pinned gate scripts and a SHA-pinned checkout (so a mistaken or
-#       tampered PR cannot grade itself or post a forged PASS), least-privilege token,
-#       bounded runtime. Fork-PR scenarios are out of scope and documented, not
-#       engineered for. ONE exception to "owner only": the GitHub mirror is PUBLIC and
-#       a template repo, so anyone can open a PR there — that is why the job is gated
-#       on the forge's server_url below, not only on a variable GitHub doesn't have.
+#       tampered PR cannot grade itself or post a forged PASS), bounded runtime. NOT
+#       least privilege: Forgejo ignores job-level `permissions:`, so the automatic
+#       token carries the forge's pull_request_target default (repo write) — which is
+#       why the only third-party action is SHA-pinned. Fork-PR scenarios are out of
+#       scope and documented, not engineered for. ONE exception to "owner only": the
+#       GitHub mirror is PUBLIC and a template repo, so anyone can open a PR there —
+#       that is why the job is gated on the forge's server_url below, not only on a
+#       variable GitHub doesn't have.
 #
 # Lives in .github/workflows (not .forgejo): Forgejo IGNORES .github/workflows once
 # .forgejo/workflows exists, so parking this file there would silently stop ci.yml
@@ -51,8 +54,11 @@ jobs:
       && github.base_ref == 'main'
       && vars.AI_REVIEW_ENABLED == 'true'
     runs-on: ubuntu-latest
-    # Least privilege for a privileged job: read to check out, write to PRs/issues ONLY
-    # to post the verdict comment.
+    # Declares the INTENDED scope (read to check out, write to PRs/issues only to post
+    # the verdict). It is NOT enforced here: Forgejo 15 ignores job-level `permissions`
+    # (forgejo.org/docs/v15.0/user/actions/github-actions), so on the forge the token
+    # has its default authority. Kept so the intent is written down and enforced if a
+    # future Forgejo honours it.
     permissions:
       contents: read
       pull-requests: write
