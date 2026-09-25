@@ -57,13 +57,26 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Run Semgrep
-        uses: returntocorp/semgrep-action@713efdd345f3035192eaa63f56867b88e63e4e5d # v1
+      # Semgrep is INSTALLED and invoked directly rather than delegated to
+      # returntocorp/semgrep-action. WHY: this repo is forge-primary (origin = Forgejo,
+      # GitHub is a mirror only), and a third-party `uses:` action does not resolve on the
+      # Forgejo runner — the job dies in ~5s having scanned nothing. Observed on
+      # claude-mcp-config and revri, both showing "Security Scan (Semgrep) — failure" at
+      # ~5s while repos that pip-install semgrep pass. Same rulesets as before.
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          config: >-
-            p/security-audit
-            p/javascript
-            p/secrets
+          python-version: '3.12'
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Run Semgrep
+        run: |
+          semgrep scan --error --quiet \
+            --config p/security-audit \
+            --config p/javascript \
+            --config p/secrets
 
   # ===========================================================================
   # Secrets Scan
@@ -78,8 +91,55 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Run Gitleaks
-        uses: gitleaks/gitleaks-action@v2
+      # Gitleaks is DOWNLOADED, checksum-verified and run directly rather than delegated
+      # to gitleaks/gitleaks-action@v2. Two reasons, both load-bearing:
+      #   1. A third-party `uses:` action does not resolve on the Forgejo runner, so the
+      #      job failed in ~5s having scanned NOTHING — a secret scan that never runs is
+      #      worse than none, because the red X reads as a flaky CI rather than no coverage.
+      #   2. gitleaks-action@v2 additionally wants a GITLEAKS_LICENSE secret that does not
+      #      exist on the forge.
+      # Pattern copied from mcp-personal-context/.github/workflows/secret-scan.yml, which
+      # passes on the forge today. An unverified download would be a supply-chain hole in
+      # the very tool guarding this repo, so the checksum comparison is not optional.
+      - name: Install pinned gitleaks
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITLEAKS_PINNED_VERSION: '8.30.1'
+          SHA256_LINUX_X64: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          SHA256_LINUX_ARM64: e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64)  arch=x64;   want="$SHA256_LINUX_X64" ;;
+            aarch64|arm64) arch=arm64; want="$SHA256_LINUX_ARM64" ;;
+            *) echo "::error::unsupported runner architecture $(uname -m)"; exit 1 ;;
+          esac
+          tarball="gitleaks_${GITLEAKS_PINNED_VERSION}_linux_${arch}.tar.gz"
+          curl -sSfL -o "$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_PINNED_VERSION}/${tarball}"
+          got=$(sha256sum "$tarball" | cut -d' ' -f1)
+          if [ "$got" != "$want" ]; then
+            echo "::error::checksum mismatch for ${tarball}"
+            echo "  expected ${want}"
+            echo "  got      ${got}"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/gitleaks-bin"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/gitleaks-bin" gitleaks
+          echo "$RUNNER_TEMP/gitleaks-bin" >> "$GITHUB_PATH"
+
+      # Assert the binary on PATH is the pinned one. Without this the scan could silently
+      # run some other gitleaks whose allowlist semantics differ, and "which files were
+      # actually scanned" is the entire value of the gate.
+      - name: Confirm the pinned binary is on PATH
+        env:
+          GITLEAKS_PINNED_VERSION: '8.30.1'
+        run: |
+          got=$(gitleaks version)
+          if [ "$got" != "$GITLEAKS_PINNED_VERSION" ]; then
+            echo "::error::expected gitleaks ${GITLEAKS_PINNED_VERSION}, PATH resolved to ${got}"
+            exit 1
+          fi
+          echo "gitleaks ${got} (pinned, checksum-verified)"
+
+      - name: Run Gitleaks
+        run: gitleaks git --no-banner --redact --verbose
