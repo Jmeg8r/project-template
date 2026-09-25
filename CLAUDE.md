@@ -16,8 +16,9 @@ npm run ship:pr       # validate the saved verify results and create the PR
 
 - **VERIFY requires tests and an AI code review to actually run.** A green `verify` alone
   doesn't prove it: the scaffold's `test`/`lint` scripts are placeholders that always pass,
-  and the AI review is skipped (not failed) when `GEMINI_API_KEY` is unset. Replace the
-  placeholders and set the key, or say plainly which check didn't run.
+  and the AI review is skipped (not failed) when `GEMINI_API_KEY` is unset. Until real tests
+  run and the key is set, VERIFY is incomplete: say plainly which check didn't run, and
+  don't ship on that result.
 - **Run `verify` fresh before shipping.** `ship:pr` reuses the saved results, including the
   audit, and only warns when they're over 4 hours old.
 - **Every PR carries the verification evidence.** `ship:pr` adds it automatically; a PR
