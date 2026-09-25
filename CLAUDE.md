@@ -11,9 +11,17 @@ verification approval before shipping, and a human-approved merge. Scaffold comm
 
 ```bash
 npm run verify        # tests, lint, `npm audit --audit-level=high`, then Gemini AI review
-                      # (the AI review is skipped with a notice when GEMINI_API_KEY is unset)
-npm run ship:pr       # validate and create PR
+npm run ship:pr       # validate the saved verify results and create the PR
 ```
+
+- **VERIFY requires tests and an AI code review to actually run.** A green `verify` alone
+  doesn't prove it: the scaffold's `test`/`lint` scripts are placeholders that always pass,
+  and the AI review is skipped (not failed) when `GEMINI_API_KEY` is unset. Replace the
+  placeholders and set the key, or say plainly which check didn't run.
+- **Run `verify` fresh before shipping.** `ship:pr` reuses the saved results, including the
+  audit, and only warns when they're over 4 hours old.
+- **Every PR carries the verification evidence.** `ship:pr` adds it automatically; a PR
+  created by hand (e.g. without `gh`) must include it too.
 
 ## Gotchas
 
