@@ -66,10 +66,12 @@ cp .env.example .env
 
 On the Sovereign Forge, `.github/workflows/ai-review.yml` reviews every PR to `main`
 through the review broker and posts a verdict comment as `forgejo-actions`.
-`forge-pr merge` refuses a PR without that verdict at its current head. The job runs only
-when the forge repo variable `AI_REVIEW_ENABLED` is `true` and the repo has a
-`BROKER_TOKEN` secret. On GitHub it never runs, so a project generated from this template
-on GitHub gets the file with the job switched off.
+`forge-pr merge` refuses a PR without that verdict at its current head. The forge repo
+variable `AI_REVIEW_ENABLED` switches the job on (it runs only when the value is `true`),
+and the `BROKER_TOKEN` secret authenticates it to the broker. A bad token doesn't skip the
+job: the broker rejects it, the job fails with no verdict, and merges stay blocked. On GitHub it
+never runs, so a project generated from this template on GitHub gets the file with the
+job switched off.
 
 `bin/review-pr.sh` and `bin/blast-radius.py` are byte-identical copies of sovereign-forge's
 `bin/`. Don't edit them here: fix them upstream and re-copy.
