@@ -1,0 +1,131 @@
+# WHAT: PR gate for project-template — local AI review of the change and its blast
+#       radius via the sovereign-forge review-broker, posted as a verdict comment by
+#       'forgejo-actions' plus this job's commit status.
+# WHY:  Until this file existed, PR heads here carried CI statuses but no verdict
+#       comment, and `forge-pr merge` (which fails closed on a missing verdict) refused
+#       every PR — #4 and #5 were merged by hand in the web UI (2026-09-25).
+# ADVISORY BY DESIGN: review-pr.sh posts findings and exits 0 on any real verdict.
+#       What makes it a MERGE gate is forge-pr: its decide() refuses to merge without
+#       a verdict comment by GATE_USER at the current head.
+# GATE KIT: bin/review-pr.sh and bin/blast-radius.py are byte-identical copies of
+#       sovereign-forge's bin/ (copied from its origin/main @ c5fd640). Never edit
+#       them here; fix upstream and re-copy. sovereign-forge's bin/check-gate-kit.sh
+#       verifies the `cmp` daily.
+#
+# THREAT MODEL (L40): single-owner repo. Forge jfcadm/project-template is private with
+#       0 collaborators and 0 forks; the GitHub push-mirror has 0 forks and only its
+#       owner as collaborator (verified 2026-09-25). The adversary is OWNER ACCIDENTS and
+#       compromised third-party code (actions, packages), not a malicious contributor.
+#       Hence: base-pinned gate scripts and a SHA-pinned checkout (so a mistaken or
+#       tampered PR cannot grade itself or post a forged PASS), bounded runtime. NOT
+#       least privilege: Forgejo ignores job-level `permissions:`, so the automatic
+#       token carries the forge's pull_request_target default (repo write) — which is
+#       why the only third-party action is SHA-pinned. Fork-PR scenarios are out of
+#       scope and documented, not engineered for. ONE exception to "owner only": the
+#       GitHub mirror is PUBLIC and a template repo, so anyone can open a PR there —
+#       that is why the job is gated on the forge's server_url below, not only on a
+#       variable GitHub doesn't have.
+#
+# Lives in .github/workflows (not .forgejo): Forgejo IGNORES .github/workflows once
+# .forgejo/workflows exists, so parking this file there would silently stop ci.yml
+# running on the forge. On GitHub it is inert: the job-level `if:` requires the forge
+# server_url and a repo variable GitHub doesn't define. Projects generated from this
+# template inherit it inert for the same reasons, until they're wired to the forge.
+name: ai-review
+
+# pull_request_target, not pull_request: with pull_request the workflow YAML ITSELF
+# executes from the PR tree, so a PR could rewrite these steps to post a forged PASS as
+# forgejo-actions or exfiltrate BROKER_TOKEN. Under pull_request_target the YAML and
+# every run: block come from the BASE ref; the PR enters only as the checked-out data
+# below. Consequence: the PR that INTRODUCES this file gets no run (nothing on base to
+# execute) — that single bootstrap PR merges manually; every later PR is gated.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  review:
+    # Kill switch: runs only while the forge repo variable AI_REVIEW_ENABLED is exactly
+    # "true". Unset means OFF, which leaves forge-pr blocking on "no verdict at head" —
+    # flip it deliberately. server_url: forge only (see header). base_ref: only the
+    # push-protected main may source trusted gate code.
+    if: >-
+      github.server_url != 'https://github.com'
+      && github.base_ref == 'main'
+      && vars.AI_REVIEW_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    # Declares the INTENDED scope (read to check out, write to PRs/issues only to post
+    # the verdict). It is NOT enforced here: Forgejo 15 ignores job-level `permissions`
+    # (forgejo.org/docs/v15.0/user/actions/github-actions), so on the forge the token
+    # has its default authority. Kept so the intent is written down and enforced if a
+    # future Forgejo honours it.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    # A forge or broker outage must not pin the runner with the gate stuck pending.
+    timeout-minutes: 20
+    steps:
+      - name: Check out the PR head as data, with full history
+        # Pinned to a reviewed commit SHA (actions/checkout v4), not the mutable tag —
+        # the same SHA claude-memory and claude-config pin: this job exposes both tokens.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          # pull_request_target checks out the BASE by default; the review subject is
+          # the PR head. It is DATA — executables are re-pinned below.
+          ref: ${{ github.event.pull_request.head.sha }}
+          # The gate diffs against the base branch; a shallow clone would leave nothing
+          # to compare and it would (correctly) refuse to review.
+          fetch-depth: 0
+
+      - name: Fail fast on missing gate dependencies
+        run: |
+          for bin in jq python3 curl git awk; do
+            command -v "$bin" >/dev/null \
+              || { echo "::error::$bin not on the runner image — the gate cannot run"; exit 1; }
+          done
+          echo "jq $(jq --version), $(python3 --version)"
+
+      # THE GATE RUNS BASE-TRUSTED CODE OVER THE PR TREE. A PR editing bin/review-pr.sh
+      # must not run its own edit with the forge token in scope. Trusted copies go to
+      # RUNNER_TEMP (not PR-shapeable), and a missing base copy FAILS CLOSED — the
+      # scripts land in the same commit as this workflow, so once the workflow runs from
+      # base the scripts are there by construction.
+      - name: Materialize the gate scripts from the protected base
+        run: |
+          git fetch origin main --quiet
+          mkdir -p "$RUNNER_TEMP/gate"
+          for f in review-pr.sh blast-radius.py; do
+            git show "origin/main:bin/$f" > "$RUNNER_TEMP/gate/$f" \
+              || { echo "::error::bin/$f absent on protected base — refusing to run an unpinned gate"; exit 1; }
+            chmod +x "$RUNNER_TEMP/gate/$f"
+          done
+          echo "gate scripts pinned to origin/main under $RUNNER_TEMP/gate"
+
+      - name: Run the review
+        env:
+          GATE_BIN: ${{ runner.temp }}/gate
+          # Forgejo's per-run, repo-scoped token; its comments post as
+          # 'forgejo-actions', which is exactly forge-pr's default GATE_USER.
+          FORGE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BROKER_TOKEN: ${{ secrets.BROKER_TOKEN }}
+          FORGE_API: http://100.88.14.2:3300/api/v1
+          BROKER_URL: http://100.88.14.2:3401
+          REVIEW_REPO: ${{ github.repository }}
+          # This CLAUDE.md has no numbered "## 3." heading. The standards are the bold
+          # bullets from "## Workflow" to EOF — 3 extracted (656 bytes) as of
+          # 2026-09-25, all under Workflow. The open end means a project generated from
+          # this template picks up bold Gotchas bullets as standards with no edit here.
+          # review-pr.sh fails closed on zero, so a heading rename surfaces loudly.
+          STANDARDS_BEGIN: '^## Workflow'
+          STANDARDS_END: '^## NEVERMATCH$'
+          # Event values reach run: through env, never ${{ }} inside the script. Both are
+          # safe today (base_ref is pinned to main by the job's if:, number is an integer),
+          # but env keeps it safe if either guard is ever loosened.
+          PR_NUMBER: ${{ github.event.number }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          # Force-update the local base ref and FAIL CLOSED if the fetch fails, so a
+          # stale main on a reused runner cannot supply obsolete standards.
+          git fetch origin "+${BASE_REF}:${BASE_REF}"
+          bash "$RUNNER_TEMP/gate/review-pr.sh" --pr "$PR_NUMBER" --base "$BASE_REF"
