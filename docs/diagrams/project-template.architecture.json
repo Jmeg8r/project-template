@@ -1,0 +1,299 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "project-template \u2014 Ironclad workflow starter",
+    "output": "project-template.architecture.html",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "verify",
+        "label": "Verify",
+        "focus": [
+          "dev",
+          "verify",
+          "npm",
+          "review",
+          "gemini",
+          "vstate"
+        ],
+        "note": "npm run verify hashes files, runs test, lint and audit, spawns the Gemini review and writes verify-state.json."
+      },
+      {
+        "id": "ship",
+        "label": "Ship",
+        "focus": [
+          "vstate",
+          "ship",
+          "pr",
+          "ci"
+        ],
+        "note": "npm run ship:pr re-checks hashes and gates, then opens a PR with gh; CI checks script syntax and scans."
+      },
+      {
+        "id": "plan",
+        "label": "Plan",
+        "focus": [
+          "dev",
+          "sessions"
+        ],
+        "note": "Plans and session notes start from .workflow/templates; CLAUDE.md and .cursor/rules tell assistants to follow them."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "sessions",
+      "type": "frontend",
+      "label": "Session docs",
+      "sublabel": ".workflow/sessions",
+      "pos": [
+        40,
+        80
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "tag": "templates"
+    },
+    {
+      "id": "dev",
+      "type": "external",
+      "label": "Developer",
+      "sublabel": "+ AI assistant",
+      "pos": [
+        40,
+        220
+      ],
+      "size": [
+        140,
+        60
+      ]
+    },
+    {
+      "id": "verify",
+      "type": "backend",
+      "label": "verify.js",
+      "sublabel": "hashes + gates",
+      "pos": [
+        250,
+        220
+      ],
+      "size": [
+        140,
+        60
+      ]
+    },
+    {
+      "id": "npm",
+      "type": "external",
+      "label": "npm scripts",
+      "sublabel": "test, lint, audit",
+      "pos": [
+        250,
+        360
+      ],
+      "size": [
+        140,
+        60
+      ],
+      "tag": "placeholders"
+    },
+    {
+      "id": "review",
+      "type": "backend",
+      "label": "ai-review.js",
+      "sublabel": "security + quality",
+      "pos": [
+        460,
+        220
+      ],
+      "size": [
+        140,
+        60
+      ]
+    },
+    {
+      "id": "gemini",
+      "type": "external",
+      "label": "Gemini API",
+      "sublabel": "gemini-2.5-flash",
+      "pos": [
+        670,
+        220
+      ],
+      "size": [
+        140,
+        60
+      ]
+    },
+    {
+      "id": "vstate",
+      "type": "database",
+      "label": "verify-state.json",
+      "sublabel": ".workflow/state",
+      "pos": [
+        460,
+        360
+      ],
+      "size": [
+        140,
+        60
+      ]
+    },
+    {
+      "id": "ship",
+      "type": "security",
+      "label": "ship.js",
+      "sublabel": "integrity check",
+      "pos": [
+        670,
+        360
+      ],
+      "size": [
+        140,
+        60
+      ]
+    },
+    {
+      "id": "pr",
+      "type": "external",
+      "label": "Pull request",
+      "sublabel": "via gh CLI",
+      "pos": [
+        880,
+        360
+      ],
+      "size": [
+        140,
+        60
+      ]
+    },
+    {
+      "id": "ci",
+      "type": "backend",
+      "label": "CI workflow",
+      "sublabel": "syntax, Semgrep, Gitleaks",
+      "pos": [
+        880,
+        500
+      ],
+      "size": [
+        140,
+        60
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "security-group",
+      "label": "Ship gate",
+      "wraps": [
+        "vstate",
+        "ship"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "dev-sessions",
+      "from": "dev",
+      "to": "sessions",
+      "label": "plan",
+      "variant": "dashed"
+    },
+    {
+      "id": "dev-verify",
+      "from": "dev",
+      "to": "verify",
+      "variant": "emphasis"
+    },
+    {
+      "id": "verify-npm",
+      "from": "verify",
+      "to": "npm",
+      "label": "run",
+      "labelDy": 24
+    },
+    {
+      "id": "verify-review",
+      "from": "verify",
+      "to": "review",
+      "label": "spawn",
+      "variant": "emphasis"
+    },
+    {
+      "id": "review-gemini",
+      "from": "review",
+      "to": "gemini",
+      "label": "HTTPS",
+      "variant": "emphasis"
+    },
+    {
+      "id": "verify-vstate",
+      "from": "verify",
+      "to": "vstate",
+      "label": "write"
+    },
+    {
+      "id": "vstate-ship",
+      "from": "vstate",
+      "to": "ship",
+      "label": "read",
+      "variant": "security"
+    },
+    {
+      "id": "ship-pr",
+      "from": "ship",
+      "to": "pr",
+      "label": "ship:pr",
+      "variant": "dashed"
+    },
+    {
+      "id": "pr-ci",
+      "from": "pr",
+      "to": "ci",
+      "label": "triggers",
+      "labelDy": 24
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Starter contents",
+      "items": [
+        "Empty src/ (main points at src/index.js)",
+        "Placeholder test and lint scripts",
+        "No runtime dependencies"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Verify",
+      "items": [
+        "SHA-256 of source files",
+        "npm audit at high level",
+        "Gemini key read from the environment"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Ship",
+      "items": [
+        "Fails on modified or missing files",
+        "Fails if a gate did not pass",
+        "--create-pr uses the gh CLI"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "CI",
+      "items": [
+        "node --check on scripts/*.js",
+        "Semgrep security rules",
+        "Pinned Gitleaks history scan"
+      ]
+    }
+  ]
+}
