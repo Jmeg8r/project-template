@@ -5,12 +5,14 @@
 ## Quick Start
 
 ```bash
-# Install dependencies (if any)
+# Install dependencies (the template itself has none)
 npm install
-
-# Run the project
-npm start
 ```
+
+The template ships no application code: `src/` holds only a `.gitkeep`, `package.json` points
+`main` at `src/index.js` (create it), and there is no `start` script until you add one. The
+`test` and `lint` scripts are placeholders that print a message and exit 0; replace them so
+`npm run verify` checks something real.
 
 ## Ironclad Workflow
 
@@ -50,6 +52,7 @@ PLAN -> EXECUTE -> VERIFY -> SHIP
 | `npm run verify:skip-ai` | Verify without AI review |
 | `npm run ai-review` | Run AI review only |
 | `npm run ai-review:diff` | Review git changes only |
+| `npm run ai-review:security` | Security-focused AI review |
 | `npm run ship` | Validate integrity |
 | `npm run ship:pr` | Validate and create PR |
 
@@ -61,6 +64,12 @@ Copy `.env.example` to `.env` and add your Gemini API key:
 cp .env.example .env
 # Edit .env and add your GEMINI_API_KEY
 ```
+
+`.env.example` is a tracked dotfile at the repo root (some file browsers hide it).
+
+The workflow scripts read `GEMINI_API_KEY` from the process environment and do not load `.env`
+themselves, so export it in your shell (or load `.env` with your own tool) before `npm run verify`.
+AI review uses the `gemini-2.5-flash` model.
 
 ### Forge PR gate
 
@@ -76,6 +85,25 @@ job switched off.
 `bin/review-pr.sh` and `bin/blast-radius.py` are byte-identical copies of sovereign-forge's
 `bin/`. Don't edit them here: fix them upstream and re-copy.
 
+## Architecture
+
+```mermaid
+flowchart TD
+    Dev["Developer + AI assistant<br/>(CLAUDE.md, .cursor/rules)"] -->|"plan"| Sessions[".workflow/sessions/<br/>plan.md, session.md"]
+    Dev -->|"npm run verify"| Verify["scripts/verify.js"]
+    Verify -->|"npm test, npm run lint, npm audit"| NPM["package.json scripts"]
+    Verify -->|"spawns"| Review["scripts/ai-review.js"]
+    Review -->|"HTTPS"| Gemini["Google Gemini API"]
+    Verify --> State[".workflow/state/verify-state.json"]
+    Dev -->|"npm run ship:pr"| Ship["scripts/ship.js"]
+    State --> Ship
+    Ship -->|"gh pr create"| PR["Pull request"]
+    PR --> CI["CI: script syntax,<br/>Semgrep, Gitleaks"]
+```
+
+A rendered diagram is in [`docs/diagrams/project-template.architecture.svg`](docs/diagrams/project-template.architecture.svg)
+(source: `docs/diagrams/project-template.architecture.json`).
+
 ## Project Structure
 
 ```
@@ -88,6 +116,7 @@ job switched off.
 │   ├── checklists/         # Security and verification checklists
 │   ├── sessions/           # Active session documents
 │   └── state/              # Verification state files
+├── docs/diagrams/          # Architecture diagram (JSON source, HTML, SVG)
 ├── .cursor/rules           # Cursor IDE workflow enforcement
 ├── CLAUDE.md               # AI assistant context
 └── package.json
