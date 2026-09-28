@@ -559,7 +559,7 @@ code=$(curl -sS -m "$REVIEW_TIMEOUT" -o "$V" -w '%{http_code}' -X POST \
 # James approved omitted prose and the two POSTMASTER tests below. Review the
 # omitted files once, preserving both reports and the original total budget.
 python3 - "$REQ" "$V" "$BHDR" "$BROKER" "$(( SECONDS - REVIEW_STARTED ))" "$REVIEW_TIMEOUT" "$REVIEW_RESPONSE_RESERVE" <<'PY_COMPLETION'
-import http.client, json, math, sys, time, urllib.request
+import http.client, json, math, re, subprocess, sys, time, urllib.request
 from pathlib import Path
 
 def complete_omitted_files(req, initial, headers, endpoint, elapsed, allowance, reserve, request=urllib.request.urlopen):
@@ -607,11 +607,22 @@ def complete_omitted_files(req, initial, headers, endpoint, elapsed, allowance, 
         if test_completion:
             # Full same-head tests and implementations supplement the retained diff.
             # The fixed allowlist excludes arbitrary source-file completion.
+            # Read from the head_sha commit, never the working tree: the diff is
+            # committed-only, so an uncommitted edit would certify coverage for code
+            # the PR does not contain (Codex [P2] on 7ae3160).
             def content(p):
-                file = Path(p)
-                if file.is_symlink() or not file.is_file():
+                head = req.get("head_sha")
+                if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+                    raise OSError("completion head unavailable")
+                git = lambda *args: subprocess.run(["git", *args], capture_output=True, stdin=subprocess.DEVNULL)
+                entry = git("ls-tree", "-z", head, "--", p)
+                fields = entry.stdout.split(b"\t", 1)[0].split()
+                if entry.returncode != 0 or len(fields) != 3 or fields[:2] not in ([b"100644", b"blob"], [b"100755", b"blob"]):
                     raise OSError("completion file unavailable")
-                return file.read_text()
+                blob = git("cat-file", "blob", fields[2].decode())
+                if blob.returncode != 0:
+                    raise OSError("completion file unavailable")
+                return blob.stdout.decode("utf-8")
             subset["changed"] = [{**f, "diff": f.get("diff", "") + "\nFull current-head test file:\n" + content(f["path"])}
                                  for f in subset["changed"]]
             subset["context"] = [{"path": p, "content": content(p)}
@@ -622,9 +633,13 @@ def complete_omitted_files(req, initial, headers, endpoint, elapsed, allowance, 
     except (OSError, ValueError, http.client.HTTPException):
         return {**initial, "coverage_completion": {"verdict": "error", "error": "bounded completion unavailable"}}
     combined = {**initial, "coverage_completion": completion}
-    full = (isinstance(completion, dict) and completion.get("verdict") in ("pass", "concerns", "fail")
+    # Findings from this head and model, in a shape section 6 can render.
+    retainable = (isinstance(completion, dict) and completion.get("verdict") in ("pass", "concerns", "fail")
         and completion.get("head_sha") == req.get("head_sha")
         and completion.get("model") == initial.get("model")
+        and isinstance(completion.get("findings"), list)
+        and all(isinstance(f, dict) for f in completion["findings"]))
+    full = (retainable
         and completion.get("examined_overcounted") is False
         and completion.get("examined_changed_overcounted") is False
         and completion.get("unmatched_path_count", 0) == 0
@@ -642,8 +657,9 @@ def complete_omitted_files(req, initial, headers, endpoint, elapsed, allowance, 
         and set(completion["examined_changed_paths"]) == set(missing)
         and completion.get("missing_changed_paths", []) == []
         and max(time.monotonic() - started, completion["duration_s"]) <= budget)
+    ranks = {"pass": 0, "concerns": 1, "fail": 2}
+    kind = "tests" if test_completion else "documents"
     if full:
-        ranks = {"pass": 0, "concerns": 1, "fail": 2}
         combined.update({
             "initial_review": initial,
             "verdict": max((initial["verdict"], completion["verdict"]), key=ranks.get),
@@ -651,9 +667,20 @@ def complete_omitted_files(req, initial, headers, endpoint, elapsed, allowance, 
             "files_examined_changed": len(paths),
             "files_examined": min(initial["files_supplied_total"], initial["files_examined"] + len(missing)),
             "files_examined_source": "review+test-completion" if test_completion else "review+document-completion",
-            "completion_kind": "tests" if test_completion else "documents",
+            "completion_kind": kind,
             "examined_changed_paths": paths, "missing_changed_paths": [],
             "duration_s": max(elapsed, cost) + max(time.monotonic() - started, completion["duration_s"]),
+            "cached": initial.get("cached", False) and completion.get("cached", False),
+        })
+    # A completion that still missed a file cannot promote coverage, but its findings are
+    # real: only coverage_completion held them, which section 6 never renders, so a
+    # partial FAIL after an initial CONCERNS posted CONCERNS (Codex [P2] on 7ae3160). The
+    # verdict can only escalate, and the counts stay the initial review's.
+    elif retainable:
+        combined.update({
+            "verdict": max((initial["verdict"], completion["verdict"]), key=ranks.get),
+            "findings": initial["findings"] + completion["findings"],
+            "completion_partial": True, "completion_kind": kind,
             "cached": initial.get("cached", False) and completion.get("cached", False),
         })
     return combined
@@ -990,6 +1017,9 @@ BODY=$(jq -r --arg sha "${HEAD_SHA:0:8}" --arg br "$BR_COUNT" --arg scanned "$BR
     "> **Bounded completion** — the initial review read " +
     (.initial_review.files_examined_changed|tostring) + "/" + ($changed|tostring) +
     " changed files. A separate review examined the omitted " + (.completion_kind // "documents") + " within the same client deadline. Both broker reports remain cached separately; all findings are retained below.\n\n"
+   elif .completion_partial == true then
+    "> **Partial completion** — a separate review of the omitted " + (.completion_kind // "documents") +
+    " did not account for all of them, so the counts above come from the initial review alone. Its verdict and findings are merged below.\n\n"
    else "" end) +
   # Placed AFTER the metadata line terminates, not inside it. Injected mid-line it landed
   # between "supplied file(s) examined · " and the changed-file ratio, splitting the
