@@ -123,6 +123,15 @@ echo "── reviewing $REPO PR #$PR at ${HEAD_SHA:0:8} (base $BASE)"
 #        tweaked it" is, and is the more common shape.
 # mcp-techkb and astgl-articles get a byte-identical copy of this script, so their local
 # git config is not part of its contract (Codex [P2], 2026-08-29).
+#
+# Captured to a FILE with its exit status checked, never read through `< <(git diff …)`:
+# bash never checks a process substitution's status, so a git that failed exactly on a
+# record boundary handed the loop a complete-looking PREFIX of the file list. The
+# mid-record checks below cannot see that, and blast-radius.py's own diff only catches a
+# failure that repeats (viceroy #28; sovereign-forge PR #130).
+_NS=$(mktemp)
+git diff --name-status -z -M -C -l0 "$BASE...HEAD" > "$_NS" \
+  || die "git diff --name-status failed — refusing to review a file list that may be partial"
 CHANGED=()
 CHANGED_STATUS=()
 while IFS= read -r -d '' _st; do
@@ -154,7 +163,8 @@ while IFS= read -r -d '' _st; do
     T*) CHANGED+=("$_p1"); CHANGED_STATUS+=("typechange") ;;
     *)  CHANGED+=("$_p1"); CHANGED_STATUS+=("modified") ;;
   esac
-done < <(git diff --name-status -z -M -C -l0 "$BASE...HEAD")
+done < "$_NS"
+rm -f "$_NS"
 
 # ---- 1b. generated artifacts: excluded from review, never silently ----------------
 # WHY: /doco-refresh commits an Archify system map as THREE files — a typed JSON IR (the
@@ -548,153 +558,11 @@ V=$(mktemp); BHDR=$(mktemp); trap 'rm -f "$REQ" "$DTMP" "$CJSON" "$V" "$BHDR"' E
 # only by this user -- unlike argv. An unauthenticated broker leaves the file empty,
 # which curl accepts as "no extra headers".
 if [ -n "$BT" ]; then printf 'Authorization: Bearer %s\n' "$BT" > "$BHDR"; fi
-# Match the broker's existing whole-request allowance and response reserve.
+# The broker's whole-request allowance: coverage completion (#123) runs inside it.
 REVIEW_TIMEOUT=900
-REVIEW_RESPONSE_RESERVE=10
-REVIEW_STARTED=$SECONDS
 code=$(curl -sS -m "$REVIEW_TIMEOUT" -o "$V" -w '%{http_code}' -X POST \
        -H @"$BHDR" -H 'Content-Type: application/json' \
        --data-binary @"$REQ" "$BROKER/review") || die "broker unreachable at $BROKER"
-
-# James approved omitted prose and the two POSTMASTER tests below. Review the
-# omitted files once, preserving both reports and the original total budget.
-python3 - "$REQ" "$V" "$BHDR" "$BROKER" "$(( SECONDS - REVIEW_STARTED ))" "$REVIEW_TIMEOUT" "$REVIEW_RESPONSE_RESERVE" <<'PY_COMPLETION'
-import http.client, json, math, re, subprocess, sys, time, urllib.request
-from pathlib import Path
-
-def complete_omitted_files(req, initial, headers, endpoint, elapsed, allowance, reserve, request=urllib.request.urlopen):
-    paths = [f.get("path") for f in req.get("changed", [])]
-    missing = initial.get("missing_changed_paths", [])
-    examined = initial.get("examined_changed_paths", [])
-    count = initial.get("files_examined_changed")
-    docs = lambda p: isinstance(p, str) and p.lower().endswith((".md", ".markdown", ".rst"))
-    test_implementations = {
-        "src/postmaster/scheduled-digest.test.ts": "src/postmaster/scheduled-digest.ts",
-        "src/scheduler.test.ts": "src/scheduler.ts",
-    }
-    test_completion = (isinstance(missing, list) and bool(missing)
-        and all(isinstance(p, str) and p in test_implementations for p in missing)
-        and isinstance(examined, list)
-        and all(test_implementations[p] in examined for p in missing))
-    valid = (initial.get("verdict") in ("pass", "concerns", "fail")
-        and isinstance(missing, list) and missing
-        and (all(docs(p) for p in missing) or test_completion)
-        and isinstance(examined, list) and all(isinstance(p, str) for p in examined)
-        and all(isinstance(p, str) for p in paths) and len(set(paths)) == len(paths)
-        and len(set(missing)) == len(missing) and set(missing) <= set(paths)
-        and set(examined) == set(paths) - set(missing)
-        and type(count) is int and count == len(set(examined))
-        and type(initial.get("files_examined")) is int and initial["files_examined"] >= count
-        and type(initial.get("files_supplied_total")) is int
-        and initial["files_examined"] <= initial["files_supplied_total"]
-        and initial.get("examined_overcounted") is False
-        and initial.get("examined_changed_overcounted") is False
-        and initial.get("unmatched_path_count", 0) == 0
-        and initial.get("head_sha") == req.get("head_sha")
-        and req.get("mode") != "audit" and not all(docs(p) for p in paths))
-    if not valid:
-        return initial
-    # Cache hits retain the original inference cost instead of buying 900s more.
-    cost = initial.get("duration_s")
-    if (type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0):
-        return initial
-    budget = allowance - reserve - max(elapsed, cost)
-    if budget <= 0:
-        return initial
-    started = time.monotonic()
-    subset = {**req, "changed": [f for f in req["changed"] if f["path"] in missing], "context": []}
-    try:
-        if test_completion:
-            # Full same-head tests and implementations supplement the retained diff.
-            # The fixed allowlist excludes arbitrary source-file completion.
-            # Read from the head_sha commit, never the working tree: the diff is
-            # committed-only, so an uncommitted edit would certify coverage for code
-            # the PR does not contain (Codex [P2] on 7ae3160).
-            def content(p):
-                head = req.get("head_sha")
-                if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
-                    raise OSError("completion head unavailable")
-                git = lambda *args: subprocess.run(["git", *args], capture_output=True, stdin=subprocess.DEVNULL)
-                entry = git("ls-tree", "-z", head, "--", p)
-                fields = entry.stdout.split(b"\t", 1)[0].split()
-                if entry.returncode != 0 or len(fields) != 3 or fields[:2] not in ([b"100644", b"blob"], [b"100755", b"blob"]):
-                    raise OSError("completion file unavailable")
-                blob = git("cat-file", "blob", fields[2].decode())
-                if blob.returncode != 0:
-                    raise OSError("completion file unavailable")
-                return blob.stdout.decode("utf-8")
-            subset["changed"] = [{**f, "diff": f.get("diff", "") + "\nFull current-head test file:\n" + content(f["path"])}
-                                 for f in subset["changed"]]
-            subset["context"] = [{"path": p, "content": content(p)}
-                                 for p in sorted({test_implementations[p] for p in missing})]
-        call = urllib.request.Request(endpoint + "/review", data=json.dumps(subset).encode(), headers=headers)
-        with request(call, timeout=budget) as response:
-            completion = json.load(response)
-    except (OSError, ValueError, http.client.HTTPException):
-        return {**initial, "coverage_completion": {"verdict": "error", "error": "bounded completion unavailable"}}
-    combined = {**initial, "coverage_completion": completion}
-    # Findings from this head and model, in a shape section 6 can render.
-    retainable = (isinstance(completion, dict) and completion.get("verdict") in ("pass", "concerns", "fail")
-        and completion.get("head_sha") == req.get("head_sha")
-        and completion.get("model") == initial.get("model")
-        and isinstance(completion.get("findings"), list)
-        and all(isinstance(f, dict) for f in completion["findings"]))
-    full = (retainable
-        and completion.get("examined_overcounted") is False
-        and completion.get("examined_changed_overcounted") is False
-        and completion.get("unmatched_path_count", 0) == 0
-        and type(completion.get("files_examined_changed")) is int
-        and completion["files_examined_changed"] == len(missing)
-        and type(completion.get("files_examined")) is int
-        and len(missing) <= completion["files_examined"] <= len(missing) + len(subset["context"])
-        and type(completion.get("files_supplied_total")) is int
-        and completion["files_supplied_total"] == len(missing) + len(subset["context"])
-        and type(completion.get("duration_s")) in (int, float)
-        and math.isfinite(completion["duration_s"]) and completion["duration_s"] >= 0
-        and isinstance(completion.get("examined_changed_paths"), list)
-        and all(isinstance(p, str) for p in completion["examined_changed_paths"])
-        and len(completion["examined_changed_paths"]) == len(missing)
-        and set(completion["examined_changed_paths"]) == set(missing)
-        and completion.get("missing_changed_paths", []) == []
-        and max(time.monotonic() - started, completion["duration_s"]) <= budget)
-    ranks = {"pass": 0, "concerns": 1, "fail": 2}
-    kind = "tests" if test_completion else "documents"
-    if full:
-        combined.update({
-            "initial_review": initial,
-            "verdict": max((initial["verdict"], completion["verdict"]), key=ranks.get),
-            "findings": initial["findings"] + completion["findings"],
-            "files_examined_changed": len(paths),
-            "files_examined": min(initial["files_supplied_total"], initial["files_examined"] + len(missing)),
-            "files_examined_source": "review+test-completion" if test_completion else "review+document-completion",
-            "completion_kind": kind,
-            "examined_changed_paths": paths, "missing_changed_paths": [],
-            "duration_s": max(elapsed, cost) + max(time.monotonic() - started, completion["duration_s"]),
-            "cached": initial.get("cached", False) and completion.get("cached", False),
-        })
-    # A completion that still missed a file cannot promote coverage, but its findings are
-    # real: only coverage_completion held them, which section 6 never renders, so a
-    # partial FAIL after an initial CONCERNS posted CONCERNS (Codex [P2] on 7ae3160). The
-    # verdict can only escalate, and the counts stay the initial review's.
-    elif retainable:
-        combined.update({
-            "verdict": max((initial["verdict"], completion["verdict"]), key=ranks.get),
-            "findings": initial["findings"] + completion["findings"],
-            "completion_partial": True, "completion_kind": kind,
-            "cached": initial.get("cached", False) and completion.get("cached", False),
-        })
-    return combined
-
-if __name__ == "__main__":
-    request_path, verdict_path, headers_path, endpoint, elapsed, allowance, reserve = sys.argv[1:]
-    headers = {"Content-Type": "application/json"}
-    for line in Path(headers_path).read_text().splitlines():
-        if line.startswith("Authorization: "):
-            headers["Authorization"] = line.split(": ", 1)[1]
-    result = complete_omitted_files(json.loads(Path(request_path).read_text()),
-        json.loads(Path(verdict_path).read_text()), headers, endpoint, float(elapsed), int(allowance), int(reserve))
-    Path(verdict_path).write_text(json.dumps(result))
-PY_COMPLETION
 
 VERDICT=$(jq -r '.verdict // "error"' "$V")
 if [ "$VERDICT" = "error" ] || [ "$code" != "200" ]; then
@@ -1013,13 +881,11 @@ BODY=$(jq -r --arg sha "${HEAD_SHA:0:8}" --arg br "$BR_COUNT" --arg scanned "$BR
   $br + " dependent(s) from " + $scanned + " scanned · " +
   (.standards_checked|tostring) + "/" + (.standards_supplied|tostring) + " project standards checked" +
   (if .cached then " · _cached verdict_" else "" end) + "\n\n" +
-  (if .initial_review then
-    "> **Bounded completion** — the initial review read " +
-    (.initial_review.files_examined_changed|tostring) + "/" + ($changed|tostring) +
-    " changed files. A separate review examined the omitted " + (.completion_kind // "documents") + " within the same client deadline. Both broker reports remain cached separately; all findings are retained below.\n\n"
-   elif .completion_partial == true then
-    "> **Partial completion** — a separate review of the omitted " + (.completion_kind // "documents") +
-    " did not account for all of them, so the counts above come from the initial review alone. Its verdict and findings are merged below.\n\n"
+  (if ((.initial_missing_changed_paths|type) == "array") and (.initial_missing_changed_paths|length) > 0 then
+    "> **Coverage completion** — the first review skipped " +
+    (.initial_missing_changed_paths|length|tostring) + " changed file(s); a second broker review of only those credited " +
+    (((.coverage_completion.examined_changed_paths // [])|length)|tostring) +
+    ". Findings from both are below, and the counts above are what the two reviews covered together.\n\n"
    else "" end) +
   # Placed AFTER the metadata line terminates, not inside it. Injected mid-line it landed
   # between "supplied file(s) examined · " and the changed-file ratio, splitting the
