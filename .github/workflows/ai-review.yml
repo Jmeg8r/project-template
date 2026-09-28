@@ -53,7 +53,12 @@ jobs:
       github.server_url != 'https://github.com'
       && github.base_ref == 'main'
       && vars.AI_REVIEW_ENABLED == 'true'
-    runs-on: ubuntu-latest
+    # arm64 is the forge's REVIEW LANE (sovereign-forge change
+    # docs/changes/2026-09-27-runner-review-lane): one runner at capacity 1, so AI reviews
+    # never overlap. On ubuntu-latest this job would run in the CI lane beside another
+    # review and spend its 900s budget waiting on the broker's REVIEW_LOCK (-> verdict
+    # "error", a red job). The server_url guard above keeps it off GitHub entirely.
+    runs-on: arm64
     # Declares the INTENDED scope (read to check out, write to PRs/issues only to post
     # the verdict). It is NOT enforced here: Forgejo 15 ignores job-level `permissions`
     # (forgejo.org/docs/v15.0/user/actions/github-actions), so on the forge the token
@@ -77,6 +82,13 @@ jobs:
           # The gate diffs against the base branch; a shallow clone would leave nothing
           # to compare and it would (correctly) refuse to review.
           fetch-depth: 0
+
+      # The arm64 image is node:22-bookworm, which lacks jq (checked 2026-09-27; the
+      # ubuntu-latest image had it). Same install step as sovereign-forge's ai-review.yml.
+      - name: Install the gate's dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq jq python3 curl git >/dev/null
 
       - name: Fail fast on missing gate dependencies
         run: |
