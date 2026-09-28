@@ -189,23 +189,44 @@ done < <(git diff --name-status -z -M -C -l0 "$BASE...HEAD")
 # prevent. Removal happens BEFORE the empty-set check below on purpose — a PR that
 # somehow contained only generated artifacts would land on "refusing to report a clean
 # review of nothing" rather than sailing through having reviewed zero files.
-GENERATED=(); GENERATED_BYTES=()
+#
+# JS LOCKFILES follow the same two-condition rule (added 2026-09-27). A dependency bump
+# rewrites pnpm-lock.yaml / package-lock.json / yarn.lock wholesale: Fiona PR #92's
+# lockfile diff is 364,542 bytes, and even a minimal re-resolve of the same manifests is
+# 234,011, so every real dependency update died at the per-file cap with no verdict.
+#   1. the basename is exactly one of those three lockfiles;
+#   2. a package.json AT OR BELOW the lockfile's directory is also in this change, so the
+#      manifest the lockfile was generated from is reviewed in its place.
+# A lockfile edited without any manifest change is not paired and still meets the cap.
+# What the model loses is the resolved tree, which it could not meaningfully judge from
+# integrity hashes anyway; resolved-dependency risk belongs to the consumer's dependency
+# audit in CI, not to this reviewer.
+GENERATED=(); GENERATED_BYTES=(); GENERATED_SRC=()
 _KEPT=(); _KEPT_STATUS=()
 _GT=$(mktemp)
 for _i in "${!CHANGED[@]}"; do
   _f="${CHANGED[$_i]}"; _s="${CHANGED_STATUS[$_i]}"
-  _paired=0
+  _paired=0; _src=""
   case "$_f" in
     docs/diagrams/*.architecture.html)
       _ir="${_f%.html}.json"
       for _c in "${CHANGED[@]}"; do
-        if [ "$_c" = "$_ir" ]; then _paired=1; break; fi
+        if [ "$_c" = "$_ir" ]; then _paired=1; _src="$_ir"; break; fi
+      done
+      ;;
+    pnpm-lock.yaml|*/pnpm-lock.yaml|package-lock.json|*/package-lock.json|yarn.lock|*/yarn.lock)
+      case "$_f" in */*) _dir="${_f%/*}/" ;; *) _dir="" ;; esac
+      for _c in "${CHANGED[@]}"; do
+        case "$_c" in
+          "${_dir}package.json"|"${_dir}"*/package.json) _paired=1; _src="$_c"; break ;;
+        esac
       done
       ;;
   esac
   if [ "$_paired" -eq 1 ]; then
     git diff "$BASE...HEAD" -- "$_f" > "$_GT"
     GENERATED+=("$_f")
+    GENERATED_SRC+=("$_src")
     GENERATED_BYTES+=("$(wc -c < "$_GT" | tr -d '[:space:]')")
   else
     _KEPT+=("$_f"); _KEPT_STATUS+=("$_s")
@@ -221,10 +242,10 @@ CHANGED=(${_KEPT[@]+"${_KEPT[@]}"}); CHANGED_STATUS=(${_KEPT_STATUS[@]+"${_KEPT_
 echo "   changed: ${#CHANGED[@]} path(s)"
 GENERATED_NOTE=""
 if [ "${#GENERATED[@]}" -gt 0 ]; then
-  echo "   generated: ${#GENERATED[@]} artifact(s) EXCLUDED from review (their IR is reviewed instead):"
+  echo "   generated: ${#GENERATED[@]} artifact(s) EXCLUDED from review (their source is reviewed instead):"
   for _i in "${!GENERATED[@]}"; do
-    echo "     - ${GENERATED[$_i]} (${GENERATED_BYTES[$_i]} bytes; source ${GENERATED[$_i]%.html}.json)"
-    GENERATED_NOTE="${GENERATED_NOTE}- \`${GENERATED[$_i]}\` (${GENERATED_BYTES[$_i]} bytes) — reviewed via its source \`${GENERATED[$_i]%.html}.json\`
+    echo "     - ${GENERATED[$_i]} (${GENERATED_BYTES[$_i]} bytes; source ${GENERATED_SRC[$_i]})"
+    GENERATED_NOTE="${GENERATED_NOTE}- \`${GENERATED[$_i]}\` (${GENERATED_BYTES[$_i]} bytes) — reviewed via its source \`${GENERATED_SRC[$_i]}\`
 "
   done
 fi
@@ -527,9 +548,126 @@ V=$(mktemp); BHDR=$(mktemp); trap 'rm -f "$REQ" "$DTMP" "$CJSON" "$V" "$BHDR"' E
 # only by this user -- unlike argv. An unauthenticated broker leaves the file empty,
 # which curl accepts as "no extra headers".
 if [ -n "$BT" ]; then printf 'Authorization: Bearer %s\n' "$BT" > "$BHDR"; fi
-code=$(curl -sS -m 900 -o "$V" -w '%{http_code}' -X POST \
+# Match the broker's existing whole-request allowance and response reserve.
+REVIEW_TIMEOUT=900
+REVIEW_RESPONSE_RESERVE=10
+REVIEW_STARTED=$SECONDS
+code=$(curl -sS -m "$REVIEW_TIMEOUT" -o "$V" -w '%{http_code}' -X POST \
        -H @"$BHDR" -H 'Content-Type: application/json' \
        --data-binary @"$REQ" "$BROKER/review") || die "broker unreachable at $BROKER"
+
+# James approved omitted prose and the two POSTMASTER tests below. Review the
+# omitted files once, preserving both reports and the original total budget.
+python3 - "$REQ" "$V" "$BHDR" "$BROKER" "$(( SECONDS - REVIEW_STARTED ))" "$REVIEW_TIMEOUT" "$REVIEW_RESPONSE_RESERVE" <<'PY_COMPLETION'
+import http.client, json, math, sys, time, urllib.request
+from pathlib import Path
+
+def complete_omitted_files(req, initial, headers, endpoint, elapsed, allowance, reserve, request=urllib.request.urlopen):
+    paths = [f.get("path") for f in req.get("changed", [])]
+    missing = initial.get("missing_changed_paths", [])
+    examined = initial.get("examined_changed_paths", [])
+    count = initial.get("files_examined_changed")
+    docs = lambda p: isinstance(p, str) and p.lower().endswith((".md", ".markdown", ".rst"))
+    test_implementations = {
+        "src/postmaster/scheduled-digest.test.ts": "src/postmaster/scheduled-digest.ts",
+        "src/scheduler.test.ts": "src/scheduler.ts",
+    }
+    test_completion = (isinstance(missing, list) and bool(missing)
+        and all(isinstance(p, str) and p in test_implementations for p in missing)
+        and isinstance(examined, list)
+        and all(test_implementations[p] in examined for p in missing))
+    valid = (initial.get("verdict") in ("pass", "concerns", "fail")
+        and isinstance(missing, list) and missing
+        and (all(docs(p) for p in missing) or test_completion)
+        and isinstance(examined, list) and all(isinstance(p, str) for p in examined)
+        and all(isinstance(p, str) for p in paths) and len(set(paths)) == len(paths)
+        and len(set(missing)) == len(missing) and set(missing) <= set(paths)
+        and set(examined) == set(paths) - set(missing)
+        and type(count) is int and count == len(set(examined))
+        and type(initial.get("files_examined")) is int and initial["files_examined"] >= count
+        and type(initial.get("files_supplied_total")) is int
+        and initial["files_examined"] <= initial["files_supplied_total"]
+        and initial.get("examined_overcounted") is False
+        and initial.get("examined_changed_overcounted") is False
+        and initial.get("unmatched_path_count", 0) == 0
+        and initial.get("head_sha") == req.get("head_sha")
+        and req.get("mode") != "audit" and not all(docs(p) for p in paths))
+    if not valid:
+        return initial
+    # Cache hits retain the original inference cost instead of buying 900s more.
+    cost = initial.get("duration_s")
+    if (type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0):
+        return initial
+    budget = allowance - reserve - max(elapsed, cost)
+    if budget <= 0:
+        return initial
+    started = time.monotonic()
+    subset = {**req, "changed": [f for f in req["changed"] if f["path"] in missing], "context": []}
+    try:
+        if test_completion:
+            # Full same-head tests and implementations supplement the retained diff.
+            # The fixed allowlist excludes arbitrary source-file completion.
+            def content(p):
+                file = Path(p)
+                if file.is_symlink() or not file.is_file():
+                    raise OSError("completion file unavailable")
+                return file.read_text()
+            subset["changed"] = [{**f, "diff": f.get("diff", "") + "\nFull current-head test file:\n" + content(f["path"])}
+                                 for f in subset["changed"]]
+            subset["context"] = [{"path": p, "content": content(p)}
+                                 for p in sorted({test_implementations[p] for p in missing})]
+        call = urllib.request.Request(endpoint + "/review", data=json.dumps(subset).encode(), headers=headers)
+        with request(call, timeout=budget) as response:
+            completion = json.load(response)
+    except (OSError, ValueError, http.client.HTTPException):
+        return {**initial, "coverage_completion": {"verdict": "error", "error": "bounded completion unavailable"}}
+    combined = {**initial, "coverage_completion": completion}
+    full = (isinstance(completion, dict) and completion.get("verdict") in ("pass", "concerns", "fail")
+        and completion.get("head_sha") == req.get("head_sha")
+        and completion.get("model") == initial.get("model")
+        and completion.get("examined_overcounted") is False
+        and completion.get("examined_changed_overcounted") is False
+        and completion.get("unmatched_path_count", 0) == 0
+        and type(completion.get("files_examined_changed")) is int
+        and completion["files_examined_changed"] == len(missing)
+        and type(completion.get("files_examined")) is int
+        and len(missing) <= completion["files_examined"] <= len(missing) + len(subset["context"])
+        and type(completion.get("files_supplied_total")) is int
+        and completion["files_supplied_total"] == len(missing) + len(subset["context"])
+        and type(completion.get("duration_s")) in (int, float)
+        and math.isfinite(completion["duration_s"]) and completion["duration_s"] >= 0
+        and isinstance(completion.get("examined_changed_paths"), list)
+        and all(isinstance(p, str) for p in completion["examined_changed_paths"])
+        and len(completion["examined_changed_paths"]) == len(missing)
+        and set(completion["examined_changed_paths"]) == set(missing)
+        and completion.get("missing_changed_paths", []) == []
+        and max(time.monotonic() - started, completion["duration_s"]) <= budget)
+    if full:
+        ranks = {"pass": 0, "concerns": 1, "fail": 2}
+        combined.update({
+            "initial_review": initial,
+            "verdict": max((initial["verdict"], completion["verdict"]), key=ranks.get),
+            "findings": initial["findings"] + completion["findings"],
+            "files_examined_changed": len(paths),
+            "files_examined": min(initial["files_supplied_total"], initial["files_examined"] + len(missing)),
+            "files_examined_source": "review+test-completion" if test_completion else "review+document-completion",
+            "completion_kind": "tests" if test_completion else "documents",
+            "examined_changed_paths": paths, "missing_changed_paths": [],
+            "duration_s": max(elapsed, cost) + max(time.monotonic() - started, completion["duration_s"]),
+            "cached": initial.get("cached", False) and completion.get("cached", False),
+        })
+    return combined
+
+if __name__ == "__main__":
+    request_path, verdict_path, headers_path, endpoint, elapsed, allowance, reserve = sys.argv[1:]
+    headers = {"Content-Type": "application/json"}
+    for line in Path(headers_path).read_text().splitlines():
+        if line.startswith("Authorization: "):
+            headers["Authorization"] = line.split(": ", 1)[1]
+    result = complete_omitted_files(json.loads(Path(request_path).read_text()),
+        json.loads(Path(verdict_path).read_text()), headers, endpoint, float(elapsed), int(allowance), int(reserve))
+    Path(verdict_path).write_text(json.dumps(result))
+PY_COMPLETION
 
 VERDICT=$(jq -r '.verdict // "error"' "$V")
 if [ "$VERDICT" = "error" ] || [ "$code" != "200" ]; then
@@ -848,6 +986,11 @@ BODY=$(jq -r --arg sha "${HEAD_SHA:0:8}" --arg br "$BR_COUNT" --arg scanned "$BR
   $br + " dependent(s) from " + $scanned + " scanned · " +
   (.standards_checked|tostring) + "/" + (.standards_supplied|tostring) + " project standards checked" +
   (if .cached then " · _cached verdict_" else "" end) + "\n\n" +
+  (if .initial_review then
+    "> **Bounded completion** — the initial review read " +
+    (.initial_review.files_examined_changed|tostring) + "/" + ($changed|tostring) +
+    " changed files. A separate review examined the omitted " + (.completion_kind // "documents") + " within the same client deadline. Both broker reports remain cached separately; all findings are retained below.\n\n"
+   else "" end) +
   # Placed AFTER the metadata line terminates, not inside it. Injected mid-line it landed
   # between "supplied file(s) examined · " and the changed-file ratio, splitting the
   # metadata in half and putting the "> " marker somewhere other than the start of a
@@ -951,8 +1094,8 @@ BODY=$(jq -r --arg sha "${HEAD_SHA:0:8}" --arg br "$BR_COUNT" --arg scanned "$BR
      " changed file(s). Findings above cover only what was read.\n"
    else "" end) +
   (if $generated == "" then "" else
-     "\n> **Generated artifacts excluded from this review** — compiled output whose typed\n" +
-     "> source IS under review in this PR. Listed so the coverage claim above is read\n" +
+     "\n> **Generated artifacts excluded from this review** — generated output (a compiled\n" +
+     "> viewer or a lockfile) whose source IS under review in this PR. Listed so the coverage claim above is read\n" +
      "> correctly: these bytes were never sent to the model.\n>\n" +
      ($generated | split("\n") | map(select(. != "")) | map("> " + .) | join("\n")) + "\n"
    end) +
