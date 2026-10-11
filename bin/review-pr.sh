@@ -12,7 +12,8 @@
 #
 # Every stage reports what it examined, and refuses to report success on an empty scan —
 # or on a PARTIAL one: an over-cap file diff, or a model that read fewer files than it was
-# given, fails the gate rather than shipping a PASS that covers less than it claims.
+# given, fails the gate rather than shipping a PASS that covers less than it claims. The one
+# exception is a PURE DELETION the model did not name, excused by path and disclosed (section 5).
 #
 # Usage: bin/review-pr.sh --pr N [--base main] [--repo owner/name] [--no-post]
 set -euo pipefail
@@ -68,7 +69,7 @@ require_count() {
 
 # Credentials come from files or the CI environment, and reach curl through a mode-0600
 # header file (-H @file), never on argv — argv is world-readable through a process list
-# for the whole life of the request, which for the broker call is up to 900s. This
+# for the whole life of the request, which for the broker call is up to 1500s. This
 # comment used to describe an intention the code did not implement: both tokens were
 # interpolated straight into curl's argument list (Codex [P2]).
 FT="${FORGE_TOKEN:-$(cat "$HOME/.config/sovereign-forge/token" 2>/dev/null || true)}"
@@ -82,7 +83,7 @@ fi
 # The forge credential is spent ONLY on the comment POST below. Demanding it up
 # front also fired in --no-post mode, which is documented in the usage line and
 # needs nothing but the broker — so a valid local review died on a credential it
-# was never going to use (Codex [P3]). Still checked before the 900s broker call
+# was never going to use (Codex [P3]). Still checked before the 1500s broker call
 # rather than after it: a review nobody can post is worth failing fast on.
 if [ "$POST" -eq 1 ] && [ -z "$FT" ]; then
   die "no forge token — needed to post the review comment (pass --no-post to print it instead)"
@@ -187,7 +188,9 @@ rm -f "$_NS"
 #   2. the sibling <name>.architecture.json IR is ALSO in this PR's changed set, so the
 #      reviewable SOURCE of that artifact is under review in the same change.
 #
-# Condition 2 is the load-bearing one. A hand-edited HTML whose IR did not change is not
+# Condition 2 is the load-bearing one, and a DELETED source (pure or rename source) never
+# satisfies it: there is nothing left to read in its place, and the unread-deletion excusal
+# in section 5 would let both go unreviewed. A hand-edited HTML whose IR did not change is not
 # paired, stays in CHANGED, and still dies at the cap — so the artifact can only be
 # skipped when the thing it is compiled from is being read. Dropping condition 2 would
 # turn this into the blanket exemption above.
@@ -220,13 +223,16 @@ for _i in "${!CHANGED[@]}"; do
   case "$_f" in
     docs/diagrams/*.architecture.html)
       _ir="${_f%.html}.json"
-      for _c in "${CHANGED[@]}"; do
-        if [ "$_c" = "$_ir" ]; then _paired=1; _src="$_ir"; break; fi
+      for _j in "${!CHANGED[@]}"; do
+        case "${CHANGED_STATUS[$_j]}" in deleted*) continue ;; esac
+        if [ "${CHANGED[$_j]}" = "$_ir" ]; then _paired=1; _src="$_ir"; break; fi
       done
       ;;
     pnpm-lock.yaml|*/pnpm-lock.yaml|package-lock.json|*/package-lock.json|yarn.lock|*/yarn.lock)
       case "$_f" in */*) _dir="${_f%/*}/" ;; *) _dir="" ;; esac
-      for _c in "${CHANGED[@]}"; do
+      for _j in "${!CHANGED[@]}"; do
+        case "${CHANGED_STATUS[$_j]}" in deleted*) continue ;; esac
+        _c="${CHANGED[$_j]}"
         case "$_c" in
           "${_dir}package.json"|"${_dir}"*/package.json) _paired=1; _src="$_c"; break ;;
         esac
@@ -268,7 +274,11 @@ fi
 # run the PR's OWN bin/blast-radius.py, with the forge and broker tokens in scope.
 # Ported from claude-memory, the one consumer using that trigger; defaults to bin/, so
 # every pull_request consumer is unaffected.
-BR_JSON=$("${GATE_BIN:-bin}/blast-radius.py" --json --changed-from "$BASE") \
+# --declare-generated comes LAST on purpose: a resolver that predates it reads nothing
+# after the base ref and so ignores it, where a leading unknown flag would be taken for
+# a file. It tells the resolver this gate can disclose an exclusion (see the
+# generated_excluded block below); without it the resolver excludes nothing.
+BR_JSON=$("${GATE_BIN:-bin}/blast-radius.py" --json --changed-from "$BASE" --declare-generated) \
   || die "blast-radius resolver failed its positive control — dependency scan is UNKNOWN, not empty"
 BR_COUNT=$(echo "$BR_JSON" | jq '.blast_radius | length')
 BR_SCANNED=$(echo "$BR_JSON" | jq '.files_scanned')
@@ -288,6 +298,40 @@ if [ "$BR_UNREADABLE" -gt 0 ]; then
   echo "   blast radius: $BR_UNREADABLE tracked file(s) could not be read and were never searched — this blast radius is INCOMPLETE"
 elif [ "$BR_UNREADABLE" -lt 0 ]; then
   echo "   blast radius: the resolver did not report its unreadable files — completeness is UNKNOWN"
+fi
+# Compiled diagram viewers the resolver set aside because it searched their JSON source
+# instead (blast-radius.py, GENERATED_VIEWER_DIR). They are NOT in `unreadable`, so the
+# sweep counts as complete and the full all-clear returns -- which is only honest if each
+# one is declared in section 6. Carried as text lines for that comment.
+#
+# Shape is ALLOWLISTED, because these strings go into a comment forge-pr parses: absent
+# or null is "nothing excluded" (a resolver that predates the key cannot have excluded
+# anything); a list whose every entry is {path, source} with the generated path shape,
+# built ONLY from the characters blast-radius.py's GENERATED_PATH_RE allows, and the
+# source being the path's own sibling, is accepted; EVERYTHING else is UNKNOWN and fatal.
+# A tracked path may legally contain a newline, and
+# "docs/diagrams/a\n### 🔴 x.architecture.html" would otherwise post a forged finding
+# header. The character test looks for any character OUTSIDE the set rather than
+# anchoring a match of the whole string: in jq's regex flavour ^ and $ match at line
+# breaks, so an anchored pattern would pass a value whose FIRST line was clean. Unlike `unreadable`, a bad value here is not advisory: it is a
+# claim that files were safely skipped, and an unverifiable one must not be posted.
+BR_GENERATED_NOTE=$(echo "$BR_JSON" | jq -r '
+  def clean: type == "string" and length > 0 and (test("[^A-Za-z0-9._/-]") | not);
+  if (has("generated_excluded") | not) or .generated_excluded == null then empty
+  elif (.generated_excluded | type) == "array"
+       and (.generated_excluded | all(
+              type == "object"
+              and (.path | clean) and (.source | clean)
+              and (.path | startswith("docs/diagrams/")) and (.path | endswith(".architecture.html"))
+              and .source == (.path | sub("\\.architecture\\.html$"; ".architecture.json"))))
+  then .generated_excluded[] | "- `" + .path + "` (source `" + .source + "`)"
+  else error("generated_excluded is not a list of {path, source} viewer entries") end') \
+  || die "the resolver's generated_excluded list is malformed — which files it skipped is UNKNOWN, refusing to post a verdict over it"
+BR_GENERATED=0
+[ -z "$BR_GENERATED_NOTE" ] || BR_GENERATED=$(printf '%s\n' "$BR_GENERATED_NOTE" | grep -c '^- ')
+if [ "$BR_GENERATED" -gt 0 ]; then
+  echo "   blast radius: $BR_GENERATED generated viewer(s) not searched; their source was searched, or is a changed file under review:"
+  printf '%s\n' "$BR_GENERATED_NOTE" | sed 's/^/     /'
 fi
 
 # Context FILE-COUNT budget — independent of the byte budget below. The broker enforces
@@ -558,14 +602,62 @@ V=$(mktemp); BHDR=$(mktemp); trap 'rm -f "$REQ" "$DTMP" "$CJSON" "$V" "$BHDR"' E
 # only by this user -- unlike argv. An unauthenticated broker leaves the file empty,
 # which curl accepts as "no extra headers".
 if [ -n "$BT" ]; then printf 'Authorization: Bearer %s\n' "$BT" > "$BHDR"; fi
+# This opaque token lets an operator join the client failure to the broker's safe
+# start/finish record even when curl reaches its existing whole-request deadline.
+REQUEST_ID=$(od -An -N16 -tx1 /dev/urandom | tr -d '[:space:]') || die "could not create review request ID"
+case "$REQUEST_ID" in ''|*[!0-9a-f]*) die "could not create review request ID" ;; esac
+[ "${#REQUEST_ID}" -eq 32 ] || die "could not create review request ID"
+echo "   review request ID: $REQUEST_ID" >&2
+
+print_review_diagnostics() {
+  if ! jq -e --arg id "$REQUEST_ID" '
+    def bounded_seconds: type == "number" and . >= 0 and . <= 1502;
+    def safe_call:
+      type == "object"
+      and (.stage as $s | (["initial_review", "changed_files_followup",
+        "standards_followup", "coverage_completion_review",
+        "coverage_completion_followup"] | index($s)) != null)
+      and (.result as $r | (["completed", "transport_timeout", "transport_error",
+        "http_error", "response_envelope_invalid", "model_output_invalid",
+        "budget_exhausted", "internal_error"] | index($r)) != null)
+      and (.elapsed_s | bounded_seconds);
+    .review_diagnostics as $d
+    | ($d | type == "object")
+      and $d.version == 1
+      and $d.request_id == $id
+      and ($d | has("admission_wait_s"))
+      and ($d.terminal_stage as $s | (["initial_review", "changed_files_followup",
+        "standards_followup", "coverage_completion_review",
+        "coverage_completion_followup", "cache_hit", "preflight_refusal",
+        "admission_wait", "post_model_validation", "complete"] | index($s)) != null)
+      and ($d.outcome as $o | (["completed", "transport_timeout", "transport_error",
+        "http_error", "response_envelope_invalid", "model_output_invalid",
+        "budget_exhausted", "internal_error", "success", "gate_error",
+        "cache_hit", "preflight_refusal"] | index($o)) != null)
+      and ($d.cache_state as $c | (["hit", "miss", "unknown"] | index($c)) != null)
+      and ($d.elapsed_s | bounded_seconds)
+      and ($d.admission_wait_s == null or ($d.admission_wait_s | bounded_seconds))
+      and ($d.calls | type == "array" and length <= 5 and all(.[]; safe_call))
+  ' "$V" >/dev/null 2>&1; then
+    echo "   broker diagnostics unavailable (request ID: $REQUEST_ID)" >&2
+    return
+  fi
+  jq -r '.review_diagnostics | "   broker phase: \(.terminal_stage), \(.outcome); admission=\(.admission_wait_s // "unknown")s, elapsed=\(.elapsed_s)s; calls=[\([.calls[] | "\(.stage):\(.result):\(.elapsed_s)s"] | join(","))]"' "$V" >&2
+}
+
 # The broker's whole-request allowance: coverage completion (#123) runs inside it.
-REVIEW_TIMEOUT=900
-code=$(curl -sS -m "$REVIEW_TIMEOUT" -o "$V" -w '%{http_code}' -X POST \
+REVIEW_TIMEOUT=1500
+if ! code=$(curl -sS -m "$REVIEW_TIMEOUT" -o "$V" -w '%{http_code}' -X POST \
        -H @"$BHDR" -H 'Content-Type: application/json' \
-       --data-binary @"$REQ" "$BROKER/review") || die "broker unreachable at $BROKER"
+       -H "X-Review-Request-ID: $REQUEST_ID" \
+       --data-binary @"$REQ" "$BROKER/review"); then
+  print_review_diagnostics
+  die "broker unreachable at $BROKER (request ID: $REQUEST_ID)"
+fi
 
 VERDICT=$(jq -r '.verdict // "error"' "$V")
 if [ "$VERDICT" = "error" ] || [ "$code" != "200" ]; then
+  print_review_diagnostics
   die "broker returned $code / verdict=$VERDICT :: $(jq -r '.error // "no detail"' "$V")"
 fi
 
@@ -600,6 +692,44 @@ if [ "$VERDICT" = "pass" ] && [ "$STD_CHECKED" -gt "$STD_SUPPLIED" ]; then
 elif [ "$STD_CHECKED" -gt "$STD_SUPPLIED" ]; then
   echo "   NOTE: broker reports $STD_CHECKED standard(s) checked of $STD_SUPPLIED supplied — an impossible ratio; the findings stand, the ratio does not"
 fi
+# PURE DELETIONS are excused from "every changed file must be read" below, by PATH and
+# never by count. A deleted file has no post-change content, so the model does not name it
+# as read: social-media-scheduling-app PR #7 died on "read 2 of the 4 CHANGED" at c82b89e
+# with both unread paths deleted, after the broker's deletion-aware follow-up (#91) and its
+# coverage completion (#123) had both asked again. The deletion diff is still sent, and
+# blast-radius.py still searches for anything referencing a deleted path.
+#
+# Lowering the required COUNT by the number of deletions would reopen the hole
+# files_examined_changed closed: a model naming 1 deletion and 1 modified file of 2+2
+# clears "2 of 2" while a modified file went unread. So the broker's missing_changed_paths
+# must prove it: an array of distinct strings, exactly as long as the shortfall, every one
+# a path this client sent with status "deleted". Anything else excuses nothing and the
+# checks below refuse as before. Rename sources ("deleted by rename to X") are not excused.
+# Nor is a PR where NO changed file was named: excusing every path would pass a review that
+# read zero changed files, which is UNKNOWN, not clean (a deletion-only PR still fails).
+# Malformed counts are left to require_count below, which names them properly.
+DELETED_UNREAD=0
+case "$EXAMINED_CHANGED" in
+  ''|*[!0-9]*) ;;
+  *)
+    if [ "$VERDICT" = "pass" ] && [ "${#EXAMINED_CHANGED}" -le "$MAX_COUNT_DIGITS" ] \
+       && [ "$EXAMINED_CHANGED" -gt 0 ] && [ "$EXAMINED_CHANGED" -lt "${#CHANGED[@]}" ]; then
+      _del=$(for _i in "${!CHANGED[@]}"; do
+               if [ "${CHANGED_STATUS[$_i]}" = "deleted" ]; then printf '%s' "${CHANGED[$_i]}" | jq -Rs .; fi
+             done | jq -s .) || die "could not list this PR's deleted paths"
+      DELETED_UNREAD=$(jq --argjson del "$_del" --argjson short "$(( ${#CHANGED[@]} - EXAMINED_CHANGED ))" '
+        .missing_changed_paths as $m
+        | if ($m|type) == "array" and all($m[]; type == "string")
+             and ($m|length) == $short and ($m|unique|length) == $short
+             and (($m - $del)|length) == 0
+          then $short else 0 end' "$V") || die "could not read the broker's missing_changed_paths"
+      if [ "$DELETED_UNREAD" -gt 0 ]; then
+        echo "   NOTE: $DELETED_UNREAD unread changed file(s) are pure deletions — their diffs were sent, there is no remaining content to read; excused and disclosed in the comment"
+      fi
+    fi
+    ;;
+esac
+REQUIRED_READ=$(( ${#CHANGED[@]} - DELETED_UNREAD ))
 # A PASS that checked only SOME of the rules is REPORTED, not refused. Measured against
 # live traffic before this was written: viceroy PR #16 merged on a real verdict of 2/12
 # standards checked, and claude-memory's fork -- where this port came from -- would have
@@ -639,9 +769,9 @@ if [ "${#CHANGED[@]}" -gt 0 ]; then
 fi
 STD_ZERO_DOCS=0
 if [ "$VERDICT" = "pass" ] && [ "$STD_SUPPLIED" -gt 0 ] && [ "$STD_CHECKED" -eq 0 ]; then
-  if [ "$DOCS_ONLY" -eq 1 ] && [ "$EXAMINED_CHANGED" = "${#CHANGED[@]}" ]; then
+  if [ "$DOCS_ONLY" -eq 1 ] && [ "$EXAMINED_CHANGED" = "$REQUIRED_READ" ]; then
     STD_ZERO_DOCS=1
-    echo "   NOTE: docs-only PR — 0 of $STD_SUPPLIED standard(s) applied; accepted because every changed file is documentation and all ${#CHANGED[@]} were read, and disclosed in the comment"
+    echo "   NOTE: docs-only PR — 0 of $STD_SUPPLIED standard(s) applied; accepted because every changed file is documentation and all $REQUIRED_READ not excused as deletions were read, and disclosed in the comment"
   else
     die "broker checked 0 of $STD_SUPPLIED standard(s) — a clean verdict that applied none of this repo's rules is a generic review wearing this gate's badge; UNKNOWN, refusing"
   fi
@@ -649,6 +779,83 @@ fi
 # 1..N-1 is a real but tolerable gap: reported, not refused.
 if [ "$VERDICT" = "pass" ] && [ "$STD_CHECKED" -lt "$STD_SUPPLIED" ]; then
   echo "   NOTE: $STD_CHECKED of $STD_SUPPLIED standard(s) were checked — the verdict does not cover the rest"
+fi
+# Below a QUARTER on a code PR the gap is FLAGGED in the comment, still never refused
+# (docs/changes/2026-10-10-low-standards-coverage-flag). The ratio in the metadata line
+# was easy to read past: mcp-personal-context #32 passed at 1/13 and nothing drew the eye.
+# Comment-only on purpose. Measured over the verdict cache on 2026-10-10, 81 of 299
+# passing code PRs (27%) would be flagged, so a blocker here would stop about one PR in
+# four and get routed around. Strictly below: 3 of 12 is not flagged.
+# What this input IS: the model's own answer to the broker's WHICH follow-up. It is
+# sufficient to say the model did not CLAIM to check a rule. It is not evidence that a
+# named rule was applied, nor that an unnamed one was broken, so the comment says "did
+# not name", never "not met".
+# Docs-only PRs are excluded by this client's own DOCS_ONLY (set above), never by the
+# broker's flag: nearly every standard is about code, so a low count there is expected.
+# Zero checked never reaches here on a code PR; it died above.
+STD_LOW=0
+STD_UNCHECKED_LABELS=null
+# The two counts as plain decimal NUMBERS, for jq. The verdict may carry them as strings
+# ("08"): the shell tests above read that as 8, but jq handed the raw field cannot
+# subtract a string, fails, and the names of a perfectly valid list are lost (Codex [P2]).
+# Every jq below takes these, never the verdict's own fields.
+STD_LOW_CHECKED=0
+STD_LOW_SUPPLIED=0
+# At most this many standards are NAMED; the rest are counted ("and N more"). The bound is
+# what keeps two things true whatever a bootstrap PR puts in its own CLAUDE.md: the comment
+# stays a size a forge will accept, and the labels fit one argv string for section 6's jq.
+# 200 labels of "(n) " plus 100 code points is under 90 KB even at four bytes each, below
+# Linux's 128 KB per-argument limit -- and that jq call is unguarded under set -e, so an
+# oversized argument there would end the run with no comment posted. The fleet's longest
+# list on 2026-10-10 is 37.
+STD_LABEL_CAP=200
+# 10# because require_count checks digits only: a count that arrives as a zero-padded
+# string ("08") would otherwise be read as OCTAL here, error, and drop the flag silently.
+if [ "$VERDICT" = "pass" ] && [ "$DOCS_ONLY" -eq 0 ] && [ "$STD_SUPPLIED" -gt 0 ] \
+   && [ "$STD_CHECKED" -gt 0 ] && [ $(( 10#$STD_CHECKED * 4 )) -lt "$STD_SUPPLIED" ]; then
+  STD_LOW=1
+  STD_LOW_CHECKED=$(( 10#$STD_CHECKED ))
+  STD_LOW_SUPPLIED=$(( 10#$STD_SUPPLIED ))
+  # Names come from the list THIS client sent: the broker numbers that list 1..N in order
+  # and returns the numbers the model did not name, so number n is STANDARDS[n-1]. The
+  # broker's list is validated before a single label is built -- distinct integers in
+  # 1..N, exactly supplied-minus-checked of them, against a list of exactly N -- and
+  # anything else (an older broker, a cached verdict from before the follow-up, a
+  # malformed reply, a jq failure) yields null: the warning still renders, without names,
+  # and says so. Fail-open and announced; never a die, never labels from a list that
+  # failed. The number is written "(n)", not "n.": Markdown renumbers an ordered list
+  # from its first item, so 1, 3, 9 would DISPLAY as 1, 2, 3 and point at the wrong rules.
+  # Each label is one line cut to 100 code points, because on the bootstrap path the
+  # standards come from the PR's own CLAUDE.md and section 6 must be able to keep every
+  # label inside a blockquote. Every control character and every Unicode line separator
+  # (CR, LF, VT, FF, NEL, U+2028, U+2029) becomes a space, by code point rather than by
+  # regex so the result does not depend on the jq build: a lone CR is a line ending to
+  # Markdown, and the others are line endings to anything that splits lines the way
+  # Python's splitlines() does. The number is floored before printing so 2.0 shows as 2.
+  # The standards go in on STDIN, not argv: the list can be far larger than one argument
+  # may be, and this way a huge list still gets its names.
+  STD_UNCHECKED_LABELS=$(printf '%s' "$STANDARDS" | jq -c --slurpfile v "$V" --argjson cap "$STD_LABEL_CAP" \
+      --argjson n "$STD_LOW_SUPPLIED" --argjson c "$STD_LOW_CHECKED" '
+      . as $stds | $v[0] | .unchecked_standards as $u
+      | if ($u|type) == "array"
+           and ($stds|type) == "array" and ($stds|length) == $n
+           and ($u|length) == ($n - $c)
+           and ($u|all(type == "number" and . == floor and . >= 1 and . <= $n))
+           and (($u|unique|length) == ($u|length))
+        then { total: ($u|length),
+               labels: [ $u | sort | .[:$cap][]
+                         | "(" + (floor|tostring) + ") "
+                           + (($stds[. - 1] | tostring | explode
+                               | map(if . < 32 or . == 127 or . == 133 or . == 8232 or . == 8233
+                                     then 32 else . end)
+                               | implode)[0:100]) ] }
+        else null end' 2>/dev/null) || STD_UNCHECKED_LABELS=null
+  [ -n "$STD_UNCHECKED_LABELS" ] || STD_UNCHECKED_LABELS=null
+  if [ "$STD_UNCHECKED_LABELS" = "null" ]; then
+    echo "   NOTE: low standards coverage — the model named $STD_CHECKED of $STD_SUPPLIED standard(s) as checked; the list of the rest was not available"
+  else
+    echo "   NOTE: low standards coverage — the model named $STD_CHECKED of $STD_SUPPLIED standard(s) as checked; the comment lists the rest"
+  fi
 fi
 
 # The ratio is ENFORCED here, not merely printed. It used to be printed and nothing
@@ -678,7 +885,7 @@ require_count "$EXAMINED_CHANGED" files_examined_changed "a broker older than re
 # one that gets routed around, which is worse than the defect it was meant to close.
 #
 # So the rule is: every CHANGED file must have been read, because those are the subject
-# of the review — and it is now checked against a count that can actually express that.
+# of the review (pure deletions excepted by path, see DELETED_UNREAD above) — and it is now checked against a count that can actually express that.
 # files_examined could not. It sums the changed files AND the blast-radius files, so
 # "examined >= changed" was satisfied by 2 changed files plus 1 dependent while one of the
 # changed files went unread: NECESSARY, but not sufficient. review-broker.py now also
@@ -699,7 +906,7 @@ require_count "$EXAMINED_CHANGED" files_examined_changed "a broker older than re
 # the human the review without buying any safety. Same reason the broker reports this
 # shortfall instead of turning it into verdict "error": an error verdict dies above,
 # before section 6 posts anything, and destroys findings the human should still see.
-if [ "$VERDICT" = "pass" ] && [ "$EXAMINED_CHANGED" -lt "${#CHANGED[@]}" ]; then
+if [ "$VERDICT" = "pass" ] && [ "$EXAMINED_CHANGED" -lt "$REQUIRED_READ" ]; then
   die "model read $EXAMINED_CHANGED of the ${#CHANGED[@]} CHANGED file(s) — a clean verdict on a partial examination is UNKNOWN, not a pass"
 fi
 # The two counts must also agree with each other. The broker bounds
@@ -867,9 +1074,13 @@ fi
 # severity emoji, and this line is a blockquote. Verified against the deployed parser.
 BODY=$(jq -r --arg sha "${HEAD_SHA:0:8}" --arg br "$BR_COUNT" --arg scanned "$BR_SCANNED" \
   --arg generated "$GENERATED_NOTE" \
+  --arg brgen "$BR_GENERATED_NOTE" --argjson brgencount "$BR_GENERATED" \
   --argjson changed "${#CHANGED[@]}" --argjson skipped "$CTX_SKIPPED" \
   --argjson truncated "$CTX_TRUNCATED" --argjson omitted "$CTX_OMITTED" \
   --argjson unreadable "$BR_UNREADABLE" --argjson stdzerodocs "$STD_ZERO_DOCS" \
+  --argjson stdlow "$STD_LOW" --argjson stdunchecked "$STD_UNCHECKED_LABELS" \
+  --argjson stdlowchecked "$STD_LOW_CHECKED" --argjson stdlowsupplied "$STD_LOW_SUPPLIED" \
+  --argjson deletedunread "$DELETED_UNREAD" \
   --argjson ctxcap "$CONTEXT_CAP" '
   "## 🤖 Local AI review — **" + (.verdict|ascii_upcase) + "**\n\n" +
   "`" + $sha + "` · model `" + .model + "` · " +
@@ -911,6 +1122,19 @@ BODY=$(jq -r --arg sha "${HEAD_SHA:0:8}" --arg br "$BR_COUNT" --arg scanned "$BR
       "> ⚠️ The blast-radius resolver did not report which files it could not read, so " +
       "this blast radius is **unverified**. The changed files are unaffected.\n\n"
     else "" end) +
+  # Viewers the resolver set aside for their searched source (section 2). An ℹ️ and not
+  # a ⚠️: the sweep is complete, this is what "complete" was measured over. The wording
+  # covers BOTH ways a source can stand in -- searched, or itself a changed file, which
+  # no sweep searches -- because claiming "searched" for the second would be false. Same
+  # placement and every-verdict rule as the caveats above, and a blockquote throughout,
+  # so forge-pr (header, metadata and "### " finding lines only) reads the comment as
+  # before. $brgen was shape-checked in section 2: no newline or backtick can be in it.
+   (if $brgencount > 0 then
+      "> ℹ️ " + ($brgencount|tostring) + " generated diagram viewer(s) were not searched by " +
+      "the blast-radius resolver; the source each is compiled from was searched instead, " +
+      "or is itself one of the changed files under review:\n" +
+      ($brgen | split("\n") | map(select(. != "")) | map("> " + .) | join("\n")) + "\n\n"
+    else "" end) +
   # The two cuts made by the context budget, disclosed beside the refusal above and for the same
   # reason: files_examined counts what was SENT, so neither cut can show up as a
   # shortfall in the ratio. Blockquote below the metadata line, so forge-pr (header,
@@ -928,14 +1152,53 @@ BODY=$(jq -r --arg sha "${HEAD_SHA:0:8}" --arg br "$BR_COUNT" --arg scanned "$BR
   # comment, so the pass on a docs PR never reads as a rule check that did not happen.
    (if .files_examined_source == "follow-up" then
       "> ℹ️ Docs-only: the review turn reported 0 files examined (it counts files containing code), " +
-      "so the examined count above is its follow-up answer, which named every changed " +
-      "file as read.\n\n"
+      "so the examined count above comes from its follow-up answer, which named every " +
+      "changed file as read" +
+      # From the evidence in the verdict, on EVERY verdict: DELETED_UNREAD is computed for a
+      # PASS only, and the broker tie-break also yields concerns/fail with unread deletions
+      # (Codex [P2] on #142). The broker takes the tie-break only when every one is a deletion.
+      # The FIRST follow-up is what this sentence describes, so a completion that later
+      # credited a deletion must not erase it from the list (Codex [P2] on #142, round 3).
+      ((if (.initial_missing_changed_paths|type) == "array" then .initial_missing_changed_paths
+        else .missing_changed_paths end) as $unnamed
+       | if ($unnamed|type) == "array" and ($unnamed|length) > 0
+         then " except the pure deletion(s) " + ($unnamed | map("`" + tostring + "`") | join(", "))
+         else "" end) +
+      (if (.coverage_completion|type) == "object"
+       then ", plus what the coverage completion below credited" else "" end) + ".\n\n"
+    else "" end) +
+  # Only reachable once section 5 has proved every path below is a pure deletion.
+   (if $deletedunread > 0 then
+      "> ℹ️ Deleted files: the model did not name " + ($deletedunread|tostring) +
+      " pure deletion(s) as read: " +
+      (.missing_changed_paths | map("`" + . + "`") | join(", ")) + ". Their deletion " +
+      "diffs were sent and nothing of them remains to review; the blast-radius scan still " +
+      "searched for references to them. Accepted because every unread changed file is a " +
+      "deletion.\n\n"
     else "" end) +
    (if $stdzerodocs == 1 then
       "> ℹ️ Docs-only: **no project standard was applied**. This PR changes only " +
       "documentation, and the model judged none of the " +
       (.standards_supplied|tostring) + " standards applicable. This pass means the " +
       "text was read and nothing was flagged. It is not a rule check.\n\n"
+    else "" end) +
+   # Low standards coverage on a code PR (section 5 decides; this only renders). EVERY
+   # line opens with "> ": the forge-pr header, metadata and finding patterns all anchor at
+   # line start on something else, and a label is single-line, so no rule text can forge
+   # one of them. Ends on a blank line like its neighbours, so removing the block leaves
+   # the comment byte-identical to an unflagged one (selftest 16g).
+   (if $stdlow == 1 then
+      "> ⚠️ **Low standards coverage** — the model named " + ($stdlowchecked|tostring) +
+      " of " + ($stdlowsupplied|tostring) + " project standards as checked. This pass " +
+      "does not cover the rest. " +
+      (if ($stdunchecked|type) == "object" then
+         "It did not name these:\n>\n" +
+         ($stdunchecked.labels | map("> > - " + .) | join("\n")) +
+         (if $stdunchecked.total > ($stdunchecked.labels|length) then
+            "\n> > - …and " + (($stdunchecked.total - ($stdunchecked.labels|length))|tostring) +
+            " more, not listed here"
+          else "" end) + "\n\n"
+       else "The list of standards it did not name was not available.\n\n" end)
     else "" end) +
   # The console NOTE is ephemeral; THIS is the artifact a human and forge-pr actually
   # read. Without it the comment presents a clamped N/N as full coverage, and the

@@ -56,7 +56,7 @@ jobs:
     # arm64 is the forge's REVIEW LANE (sovereign-forge change
     # docs/changes/2026-09-27-runner-review-lane): one runner at capacity 1, so AI reviews
     # never overlap. On ubuntu-latest this job would run in the CI lane beside another
-    # review and spend its 900s budget waiting on the broker's REVIEW_LOCK (-> verdict
+    # review and spend its 1500s budget waiting on the broker's REVIEW_LOCK (-> verdict
     # "error", a red job). The server_url guard above keeps it off GitHub entirely.
     runs-on: arm64
     # Declares the INTENDED scope (read to check out, write to PRs/issues only to post
@@ -69,7 +69,7 @@ jobs:
       pull-requests: write
       issues: write
     # A forge or broker outage must not pin the runner with the gate stuck pending.
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Check out the PR head as data, with full history
         # Pinned to a reviewed commit SHA (actions/checkout v4), not the mutable tag —
