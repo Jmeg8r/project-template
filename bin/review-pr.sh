@@ -767,11 +767,66 @@ if [ "${#CHANGED[@]}" -gt 0 ]; then
     esac
   done
 fi
+# Dependency-only PRs are the SECOND exception, for the same reason from another file type
+# (docs/changes/2026-10-11-review-manifest-only-standards). viceroy PR #31 bumped three
+# versions to clear a critical advisory; its lockfile is excluded as generated, so the
+# model read the manifest diff, found nothing, and named 0 of 12 standards at three fresh
+# runs: a security fix with no verdict. One PR's worth of evidence, not a measured rate.
+# Dependency-only means EVERY changed path is a MODIFIED package.json whose merge-base and
+# reviewed copies are equal once DEP_KEYS are deleted. `scripts` is executable shell and
+# `version` is not a dependency, so either one changing keeps the refusal. Decided from
+# this client's paths and the repository's own bytes; no broker field or model output is
+# read. Fails closed: a copy that cannot be read or is not exactly one JSON object is NOT
+# dependency-only, and the reason is printed before the refusal below.
+# Only TOP-LEVEL key order is ignored. `jq -S` would sort at every depth, and order inside
+# `exports` decides which file Node loads: a PR that only reordered its conditions compared
+# equal and was accepted (review panel, 2026-10-11, reproduced on jq 1.6).
+# The reviewed copy is $HEAD_SHA, never HEAD: the broker call above can take 1500 s, and a
+# checkout that moved meanwhile would have this compare a different commit.
+# What it does NOT establish: that the new versions are safe. A value here may be a URL,
+# a file: path or an npm: alias; the comment says that judgement is not made (STD_ZERO_DEPS).
+# Also accepted, knowingly: an edit that changes no JSON value at all (whitespace, a BOM,
+# the file mode). And jq 1.6 reads numbers as doubles where 1.7+ keeps their text, so a
+# numeric edit outside DEP_KEYS can be refused locally and accepted in CI.
+DEP_KEYS='["dependencies","devDependencies","peerDependencies","optionalDependencies","overrides","resolutions"]'
+# shellcheck disable=SC2016  # jq variables, not shell
+DEP_JQ='if length == 1 and (.[0]|type) == "object"
+  then .[0] | delpaths($k | map([.])) | to_entries | sort_by(.key) | from_entries
+  else error("not one JSON object") end'
+# Called from the zero-standards branch below and nowhere else, so the condition that
+# decides whether it runs lives in one place. Prints why on the way out. Every command is
+# checked explicitly: errexit is off inside a function used as an `if` condition.
+deps_only() {
+  local _mb _i _f _base _head
+  [ "${#CHANGED[@]}" -gt 0 ] || { echo "   not dependency-only: no changed paths"; return 1; }
+  _mb=$(git merge-base "$BASE" "$HEAD_SHA" 2>/dev/null) \
+    || { echo "   not dependency-only: no merge base with $BASE"; return 1; }
+  for _i in "${!CHANGED[@]}"; do
+    _f="${CHANGED[$_i]}"
+    [ "${_f##*/}" = "package.json" ] \
+      || { echo "   not dependency-only: $_f is not a package.json"; return 1; }
+    [ "${CHANGED_STATUS[$_i]}" = "modified" ] \
+      || { echo "   not dependency-only: $_f is ${CHANGED_STATUS[$_i]}, not modified"; return 1; }
+    # Braced before the colon: zsh reads "$ref:path" as a history modifier. One pipeline
+    # per copy under pipefail, so a failed read and a failed parse both land here.
+    _base=$(git show "${_mb}:${_f}" 2>/dev/null | jq -s -c --argjson k "$DEP_KEYS" "$DEP_JQ" 2>/dev/null) \
+      || { echo "   not dependency-only: $_f could not be read, or did not parse as one JSON object, at the merge base"; return 1; }
+    _head=$(git show "${HEAD_SHA}:${_f}" 2>/dev/null | jq -s -c --argjson k "$DEP_KEYS" "$DEP_JQ" 2>/dev/null) \
+      || { echo "   not dependency-only: $_f could not be read, or did not parse as one JSON object, at the reviewed commit"; return 1; }
+    [ "$_base" = "$_head" ] \
+      || { echo "   not dependency-only: $_f changes more than its dependency sections"; return 1; }
+  done
+  return 0
+}
 STD_ZERO_DOCS=0
+STD_ZERO_DEPS=0
 if [ "$VERDICT" = "pass" ] && [ "$STD_SUPPLIED" -gt 0 ] && [ "$STD_CHECKED" -eq 0 ]; then
   if [ "$DOCS_ONLY" -eq 1 ] && [ "$EXAMINED_CHANGED" = "$REQUIRED_READ" ]; then
     STD_ZERO_DOCS=1
     echo "   NOTE: docs-only PR — 0 of $STD_SUPPLIED standard(s) applied; accepted because every changed file is documentation and all $REQUIRED_READ not excused as deletions were read, and disclosed in the comment"
+  elif [ "$DOCS_ONLY" -eq 0 ] && [ "$EXAMINED_CHANGED" = "$REQUIRED_READ" ] && deps_only; then
+    STD_ZERO_DEPS=1
+    echo "   NOTE: dependency-only PR — 0 of $STD_SUPPLIED standard(s) applied; accepted because every changed file is a package.json that differs only in its dependency sections and all $REQUIRED_READ were read, and disclosed in the comment"
   else
     die "broker checked 0 of $STD_SUPPLIED standard(s) — a clean verdict that applied none of this repo's rules is a generic review wearing this gate's badge; UNKNOWN, refusing"
   fi
@@ -1078,6 +1133,7 @@ BODY=$(jq -r --arg sha "${HEAD_SHA:0:8}" --arg br "$BR_COUNT" --arg scanned "$BR
   --argjson changed "${#CHANGED[@]}" --argjson skipped "$CTX_SKIPPED" \
   --argjson truncated "$CTX_TRUNCATED" --argjson omitted "$CTX_OMITTED" \
   --argjson unreadable "$BR_UNREADABLE" --argjson stdzerodocs "$STD_ZERO_DOCS" \
+  --argjson stdzerodeps "$STD_ZERO_DEPS" \
   --argjson stdlow "$STD_LOW" --argjson stdunchecked "$STD_UNCHECKED_LABELS" \
   --argjson stdlowchecked "$STD_LOW_CHECKED" --argjson stdlowsupplied "$STD_LOW_SUPPLIED" \
   --argjson deletedunread "$DELETED_UNREAD" \
@@ -1181,6 +1237,15 @@ BODY=$(jq -r --arg sha "${HEAD_SHA:0:8}" --arg br "$BR_COUNT" --arg scanned "$BR
       "documentation, and the model judged none of the " +
       (.standards_supplied|tostring) + " standards applicable. This pass means the " +
       "text was read and nothing was flagged. It is not a rule check.\n\n"
+    else "" end) +
+   # Constant text apart from one integer: nothing from the repository is rendered here.
+   (if $stdzerodeps == 1 then
+      "> ℹ️ Dependencies only: **no project standard was applied**. This PR changes only " +
+      "dependency declarations in `package.json`, and the model judged none of the " +
+      (.standards_supplied|tostring) + " standards applicable. This pass means the " +
+      "manifest diff was read and nothing was flagged. It is not a rule check, and it " +
+      "does not judge whether the new versions are safe. That takes a dependency audit " +
+      "and an image scan, which this review is not.\n\n"
     else "" end) +
    # Low standards coverage on a code PR (section 5 decides; this only renders). EVERY
    # line opens with "> ": the forge-pr header, metadata and finding patterns all anchor at
