@@ -67,6 +67,9 @@ Usage:
   bin/blast-radius.py FILE [FILE...]           # dependents of these files
   bin/blast-radius.py --changed-from BASE      # dependents of files changed vs BASE
   bin/blast-radius.py --json FILE...           # machine-readable
+  bin/blast-radius.py --json --changed-from BASE --declare-generated
+                                               # as review-pr.sh calls it: may report a
+                                               # compiled viewer as a declared exclusion
 """
 from __future__ import annotations
 
@@ -105,6 +108,49 @@ from pathlib import Path
 SKIP_SUFFIX = {".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip", ".docx", ".xlsx",
                ".woff", ".woff2", ".ico", ".zst", ".db", ".sqlite"}
 MAX_FILE_BYTES = 512_000
+
+# The ONE generated artifact the sweep may set aside rather than call unreadable: the
+# compiled diagram viewer /doco-refresh commits beside its JSON source, as
+# <name>.architecture.html and <name>.architecture.json under the directory below. The
+# viewer is ~700 KB in every repo that tracks one (33 on the forge, 710-724 KB, measured
+# 2026-10-10), so it was over MAX_FILE_BYTES on every run and the INCOMPLETE warning
+# became permanent in ten consumers -- a warning that never changes hides the unreadable
+# file that matters. Same shape and same reasoning as review-pr.sh section 1b.
+#
+# Two conditions, BOTH required, and the second is the load-bearing one:
+#   1. the path has this prefix and this suffix AND the sweep could not read it (a viewer
+#      it CAN read is searched like any other file);
+#   2. the sibling source was read and searched in this same run, or is itself a readable
+#      changed target -- in which case it is not searched (no changed file is) but is
+#      reviewed directly. An absent, oversized or undecodable source stands in for nothing.
+# Without (2) this is a blanket exemption for a path shape. Excluded files are DECLARED --
+# on the console and in the JSON -- never dropped: an undeclared exclusion reads as
+# "searched everything".
+#
+# OPT-IN, per call (--declare-generated). The two kit scripts are redeployed as a pair but
+# do drift apart: a consumer can hold this resolver beside a review-pr.sh that predates
+# `generated_excluded`. That gate reads only `unreadable`, so a viewer moved out of it
+# would vanish from the comment while the comment claimed a complete sweep -- declared
+# nowhere a reader looks. So the caller must say it can disclose an exclusion; without the
+# flag every viewer is unreadable, exactly as before. An OLDER resolver ignores the flag
+# (it reads nothing after the base ref), so the new gate is safe beside it too.
+#
+# Path characters are ALLOWLISTED, here and identically in review-pr.sh, because excluded
+# paths are printed into the comment forge-pr parses. A tracked path may hold a newline,
+# a backtick or a Unicode line separator; such a viewer is never excluded and stays
+# merely unreadable, which is advisory, rather than stopping the gate on every PR.
+#
+# THREAT MODEL: private single-owner repos; the adversary is an owner ACCIDENT, not a
+# contributor hiding a file from review. A hand-written file placed at this path shape
+# beside a small JSON would leave the sweep, declared in every comment. Accepted.
+#
+# The source stands in because the viewer is a constant runtime plus that JSON. Measured
+# with this file's own token rules on four consumers: every target the viewer matched,
+# the source matched too (0 viewer-only matches). Re-measured per consumer at redeploy.
+GENERATED_VIEWER_DIR = "docs/diagrams/"
+GENERATED_VIEWER_SUFFIX = ".architecture.html"
+GENERATED_SOURCE_SUFFIX = ".architecture.json"
+GENERATED_PATH_RE = re.compile(r"[A-Za-z0-9._/-]+")
 
 # Files whose relative import specifiers get resolved structurally. Everything not in
 # this set stays on literal-reference matching.
@@ -759,9 +805,14 @@ def resolve_js_specifier(importer_rel: str, spec: str, known: set[str]) -> set[s
 
 
 def find_dependents(root: Path, targets: list[str],
-                    rename_pairs: list[tuple[str, str]] | None = None
-                    ) -> tuple[dict, int, list[str]]:
-    """Returns (dependents_by_target, files_scanned, scan_errors)."""
+                    rename_pairs: list[tuple[str, str]] | None = None,
+                    declare_generated: bool = False
+                    ) -> tuple[dict, int, list[str], list[tuple[str, str]]]:
+    """Returns (dependents_by_target, files_scanned, scan_errors, generated_excluded).
+
+    generated_excluded is (viewer, source) pairs: compiled viewers the sweep could not
+    read whose source stands in for them. Always empty unless declare_generated is set.
+    See GENERATED_VIEWER_DIR."""
     files = tracked_files(root)
     basename_counts = Counter(f.name for f in files)
     target_set = set(targets)
@@ -806,6 +857,10 @@ def find_dependents(root: Path, targets: list[str],
                for t in targets}
     deps: dict[str, set] = {t: set() for t in targets}
     scanned, errors = 0, []
+    # Paths that were actually read and searched, and unreadable viewers waiting on them.
+    # Pairing is decided AFTER the loop so it cannot depend on the order git lists files.
+    searched: set[str] = set()
+    pending_viewers: list[str] = []
 
     def _py_match(forms: set[str], is_pkg: bool, imports: set[str]) -> bool:
         if forms & imports:
@@ -822,9 +877,16 @@ def find_dependents(root: Path, targets: list[str],
         if text is None:
             continue
         if text is SKIPPED:
-            errors.append(rel)  # inspectable but unreadable — main() fails closed
+            if (declare_generated
+                    and rel.startswith(GENERATED_VIEWER_DIR)
+                    and rel.endswith(GENERATED_VIEWER_SUFFIX)
+                    and GENERATED_PATH_RE.fullmatch(rel)):
+                pending_viewers.append(rel)  # unreadable unless its source was searched
+            else:
+                errors.append(rel)  # inspectable but unreadable — main() fails closed
             continue
         scanned += 1
+        searched.add(rel)
         # Resolved once per FILE, not once per target: the specifiers a file contains
         # do not depend on which target is being asked about.
         resolved: set[str] = set()
@@ -845,7 +907,21 @@ def find_dependents(root: Path, targets: list[str],
             imported = imports is not None and _py_match(form_map[t], pkg_map[t], imports)
             if named or imported:
                 deps[t].add(rel)
-    return deps, scanned, errors
+    excluded: list[tuple[str, str]] = []
+    for rel in pending_viewers:
+        source = rel[:-len(GENERATED_VIEWER_SUFFIX)] + GENERATED_SOURCE_SUFFIX
+        # A source that is itself a changed target was skipped by the loop above, as
+        # every changed file is, so it was NOT searched and is not in `searched`. It
+        # still pairs, when tracked and readable, because it is reviewed directly: the
+        # model reads the changed files themselves. A DELETED source is in neither set
+        # and pairs with nothing.
+        target_source = (source in target_set and source in tracked_rels
+                         and isinstance(readable_text(root / source), str))
+        if source in searched or target_source:
+            excluded.append((rel, source))
+        else:
+            errors.append(rel)
+    return deps, scanned, errors, excluded
 
 
 def positive_control(root: Path) -> tuple[bool, str]:
@@ -999,7 +1075,8 @@ def changed_files(root: Path, base: str) -> tuple[list[str], list[tuple[str, str
 def main() -> int:
     args = sys.argv[1:]
     as_json = "--json" in args
-    args = [a for a in args if a != "--json"]
+    declare_generated = "--declare-generated" in args
+    args = [a for a in args if a not in ("--json", "--declare-generated")]
     root = repo_root()
 
     if args and args[0] == "--changed-from":
@@ -1023,7 +1100,8 @@ def main() -> int:
                          f"       that cannot find a string it was told is there is broken.\n")
         return 1
 
-    deps, scanned, scan_errors = find_dependents(root, targets, rename_pairs)
+    deps, scanned, scan_errors, excluded = find_dependents(
+        root, targets, rename_pairs, declare_generated)
     # The third return value used to be discarded into `_`: files the sweep could not
     # read looked exactly like files with no dependents. They are now counted, named on
     # the console, and carried in the JSON as `unreadable`, so a partial sweep is
@@ -1048,6 +1126,11 @@ def main() -> int:
             f"were never searched: {shown}{more}\n"
             f"         Any of them may reference a changed target, so this blast radius "
             f"is INCOMPLETE, not proven empty.\n")
+    # Declared on every run that has one, in both output modes: see GENERATED_VIEWER_DIR.
+    # Worded as a NOTE so it cannot be read as the INCOMPLETE warning above.
+    for viewer, source in sorted(excluded):
+        sys.stderr.write(f"NOTE: generated viewer not searched; its source was searched, "
+                         f"or is a changed file under review: {viewer} (source {source})\n")
     # The control proves the tree is READABLE; this proves the sweep actually WALKED it.
     # Those are different claims, and only checking the first leaves a path where the
     # control passes while zero files were examined. Prompted by the gate reviewing its
@@ -1062,6 +1145,7 @@ def main() -> int:
         print(json.dumps({
             "targets": targets, "files_scanned": scanned,
             "unreadable": sorted(scan_errors),
+            "generated_excluded": [{"path": v, "source": s} for v, s in sorted(excluded)],
             "control": control_msg,
             "dependents": {t: sorted(v) for t, v in deps.items()},
             "blast_radius": total,
