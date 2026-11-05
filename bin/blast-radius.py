@@ -75,6 +75,9 @@ Usage:
   bin/blast-radius.py --not-applicable VERDICT N < standards (a JSON array)
                                                # review-pr.sh 5: judge and render a verdict's
                                                # per-standard not-applicable reasons
+  bin/blast-radius.py --unmatched VERDICT REQUEST
+                                               # review-pr.sh 5: re-judge and render findings
+                                               # that name no supplied file (CLAUDE.md 4.8)
 """
 from __future__ import annotations
 
@@ -1404,12 +1407,61 @@ def not_applicable_cli(args: list[str]) -> int:
     return 0
 
 
+def _one_line(v: object) -> str:
+    return (v if isinstance(v, str) else json.dumps(v)).replace("\n", " ").replace("`", "'")
+
+
+def unmatched_cli(args: list[str]) -> int:
+    """--unmatched VERDICT REQUEST: the findings the broker marked `unmatched_file`, whose
+    `file` is no changed or blast-radius path of REQUEST, are kept out of the verdict
+    (CLAUDE.md section 4.8). Exit 0 with the comment's disclosure of them on stdout (empty
+    when there are none); exit 1 when a mark sits on a path REQUEST did supply, because then
+    the verdict left a real finding out and cannot be trusted; 2 on bad usage."""
+    if len(args) != 2:
+        sys.stderr.write("--unmatched needs VERDICT REQUEST\n")
+        return 2
+    try:
+        verdict, req = (json.loads(Path(a).read_text()) for a in args)
+        supplied = {str(f["path"]) for key in ("changed", "context")
+                    for f in req.get(key) or [] if isinstance(f, dict) and f.get("path")}
+        findings = [f for f in verdict.get("findings") or [] if isinstance(f, dict)]
+    except (OSError, ValueError, AttributeError) as e:
+        sys.stderr.write(f"   unmatched findings: unreadable ({e})\n")
+        return 1
+    marked = [f for f in findings if f.get("unmatched_file") is True]
+    wrong = sorted({f["file"] for f in marked if isinstance(f.get("file"), str)
+                    and f["file"] in supplied})
+    if wrong:
+        sys.stderr.write(f"   broker marked a finding on {', '.join(wrong)} as naming no "
+                         "supplied file, but this request supplied it: the verdict left it "
+                         "out, so it cannot be trusted\n")
+        return 1
+    stale = sum(1 for f in findings if f.get("unmatched_file") is not True
+                and not (isinstance(f.get("file"), str) and f["file"] in supplied))
+    if stale:
+        sys.stderr.write(f"   NOTE: {stale} finding(s) name no supplied file but are unmarked "
+                         "and counted: the broker predates CLAUDE.md 4.8\n")
+    if not marked:
+        return 0
+    sys.stderr.write(f"   unmatched findings: {len(marked)}, shown apart and not counted\n")
+    sys.stdout.write(
+        f"\n> **Not counted toward the verdict**: {len(marked)} finding(s) name no file this "
+        "review was given (neither a changed file nor a dependent), so they cannot describe "
+        "what this change did. Shown so nothing the model said is hidden:\n>\n"
+        + "\n".join(f"> - `{_one_line(f.get('file'))}` — {_one_line(f.get('severity'))} / "
+                     f"{_one_line(f.get('category'))}: {_one_line(f.get('summary'))}"
+                     for f in marked) + "\n")
+    return 0
+
+
 def main() -> int:
     args = sys.argv[1:]
     if args and args[0] == "--jsonl-digest":
         return ledger_digest_cli(args[1:])
     if args and args[0] == "--not-applicable":
         return not_applicable_cli(args[1:])
+    if args and args[0] == "--unmatched":
+        return unmatched_cli(args[1:])
     as_json = "--json" in args
     declare_generated = "--declare-generated" in args
     args = [a for a in args if a not in ("--json", "--declare-generated")]

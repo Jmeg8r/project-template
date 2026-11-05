@@ -712,6 +712,7 @@ EXAMINED=$(jq -r .files_examined "$V"); SUBMITTED=$(jq -r .files_supplied_total 
 EXAMINED_CHANGED=$(jq -r .files_examined_changed "$V")
 STD_CHECKED=$(jq -r '.standards_checked' "$V"); STD_SUPPLIED=$(jq -r '.standards_supplied' "$V")
 FINDINGS=$(jq '.findings | length' "$V")
+UM=$("${GATE_BIN:-bin}/blast-radius.py" --unmatched "$V" "$REQ") || die "unmatched-finding check failed"
 echo "   verdict: $VERDICT — $FINDINGS finding(s), examined $EXAMINED/$SUBMITTED supplied file(s) ($EXAMINED_CHANGED/${#CHANGED[@]} changed), $STD_CHECKED/$STD_SUPPLIED standard(s)"
 
 # The standards ratio is ENFORCED, not just rendered into the comment. This gate's whole
@@ -1220,7 +1221,7 @@ BODY=$(jq -r --arg sha "${HEAD_SHA:0:8}" --arg br "$BR_COUNT" --arg scanned "$BR
   --argjson stdlowchecked "$STD_LOW_CHECKED" --argjson stdlowsupplied "$STD_LOW_SUPPLIED" \
   --argjson deletedunread "$DELETED_UNREAD" \
   --argjson binaryunread "$BINARY_UNREAD" \
-  --argjson ctxcap "$CONTEXT_CAP" '
+  --argjson ctxcap "$CONTEXT_CAP" --arg um "$UM" '
   "## 🤖 Local AI review — **" + (.verdict|ascii_upcase) + "**\n\n" +
   "`" + $sha + "` · model `" + .model + "` · " +
   (.files_examined|tostring) + "/" + (.files_supplied_total|tostring) + " supplied file(s) examined" +
@@ -1403,7 +1404,7 @@ BODY=$(jq -r --arg sha "${HEAD_SHA:0:8}" --arg br "$BR_COUNT" --arg scanned "$BR
   # on a third axis. `!= false` is the allowlist the guards upstream use: absent is
   # untrustworthy, not trustworthy (absent is still fatal on a PASS, so only `true`
   # reaches here with zero findings -- the broker maps zero findings to `pass`).
-  (if (.findings|length) == 0 then
+  (if (.findings|map(select(.unmatched_file|not))|length) == 0 then
      (if (.files_examined < .files_supplied_total)
          or (.files_examined_changed < $changed)
          or (.examined_overcounted != false)
@@ -1413,11 +1414,12 @@ BODY=$(jq -r --arg sha "${HEAD_SHA:0:8}" --arg br "$BR_COUNT" --arg scanned "$BR
          or ($unreadable != 0)
       then "No findings in the changed code.\n"
       else "No findings in the changed code or its blast radius.\n" end)
-   else ((.findings | map(
+   else ((.findings|map(select(.unmatched_file|not)) | map(
      "### " + (if .severity=="critical" then "🔴" elif .severity=="major" then "🟠" else "🟡" end) +
      " " + .severity + " — " + .category + "\n" +
      "**" + .file + (if .line then ":" + (.line|tostring) else "" end) + "** — " + .summary + "\n\n" +
      .why + "\n") | join("\n"))) end) +
+  ($um|if .=="" then . else .+"\n" end)+
   (if (.files_examined < .files_supplied_total)
       or (.files_examined_changed < $changed) then
      "\n> ⚠ **Reduced coverage** — read " + (.files_examined|tostring) + " of " +
