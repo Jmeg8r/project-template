@@ -1407,6 +1407,17 @@ def not_applicable_cli(args: list[str]) -> int:
     return 0
 
 
+def _json_type(v: object) -> str:
+    """The value's JSON type, named as jq's `type` names it."""
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "boolean"
+    if isinstance(v, (int, float)):
+        return "number"
+    return {str: "string", list: "array", dict: "object"}.get(type(v), type(v).__name__)
+
+
 def _one_line(v: object) -> str:
     return (v if isinstance(v, str) else json.dumps(v)).replace("\n", " ").replace("`", "'")
 
@@ -1415,8 +1426,9 @@ def unmatched_cli(args: list[str]) -> int:
     """--unmatched VERDICT REQUEST: the findings the broker marked `unmatched_file`, whose
     `file` is no changed or blast-radius path of REQUEST, are kept out of the verdict
     (CLAUDE.md section 4.8). Exit 0 with the comment's disclosure of them on stdout (empty
-    when there are none); exit 1 when a mark sits on a path REQUEST did supply, because then
-    the verdict left a real finding out and cannot be trusted; 2 on bad usage."""
+    when there are none); exit 1 when `findings` is not a list of objects, or when a mark
+    sits on a path REQUEST did supply, because then the verdict left a real finding out and
+    cannot be trusted; 2 on bad usage."""
     if len(args) != 2:
         sys.stderr.write("--unmatched needs VERDICT REQUEST\n")
         return 2
@@ -1424,7 +1436,23 @@ def unmatched_cli(args: list[str]) -> int:
         verdict, req = (json.loads(Path(a).read_text()) for a in args)
         supplied = {str(f["path"]) for key in ("changed", "context")
                     for f in req.get(key) or [] if isinstance(f, dict) and f.get("path")}
-        findings = [f for f in verdict.get("findings") or [] if isinstance(f, dict)]
+        findings = verdict.get("findings")
+        # The gate's only check of the findings shape; review-pr.sh calls this before jq
+        # counts them, because jq's length reads a missing or null findings as 0 and a
+        # string as its character count (geekspace #102, comment 29377). Here, not in
+        # review-pr.sh, because that script is at its own DIFF_CAP (selftest
+        # "installability"). A non-object entry is refused too, never skipped.
+        if "findings" not in verdict:
+            problem = "findings absent"
+        elif not isinstance(findings, list):
+            problem = f"findings is {_json_type(findings)}"
+        else:
+            problem = next((f"findings has an entry of type {_json_type(f)}" for f in findings
+                            if not isinstance(f, dict)), None)
+        if problem:
+            sys.stderr.write(f"   broker verdict malformed: {problem}, expected a list of "
+                             "finding objects\n")
+            return 1
     except (OSError, ValueError, AttributeError) as e:
         sys.stderr.write(f"   unmatched findings: unreadable ({e})\n")
         return 1

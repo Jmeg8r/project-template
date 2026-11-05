@@ -711,8 +711,8 @@ fi
 EXAMINED=$(jq -r .files_examined "$V"); SUBMITTED=$(jq -r .files_supplied_total "$V")
 EXAMINED_CHANGED=$(jq -r .files_examined_changed "$V")
 STD_CHECKED=$(jq -r '.standards_checked' "$V"); STD_SUPPLIED=$(jq -r '.standards_supplied' "$V")
+UM=$("${GATE_BIN:-bin}/blast-radius.py" --unmatched "$V" "$REQ") || die "findings check failed"
 FINDINGS=$(jq '.findings | length' "$V")
-UM=$("${GATE_BIN:-bin}/blast-radius.py" --unmatched "$V" "$REQ") || die "unmatched-finding check failed"
 echo "   verdict: $VERDICT — $FINDINGS finding(s), examined $EXAMINED/$SUBMITTED supplied file(s) ($EXAMINED_CHANGED/${#CHANGED[@]} changed), $STD_CHECKED/$STD_SUPPLIED standard(s)"
 
 # The standards ratio is ENFORCED, not just rendered into the comment. This gate's whole
