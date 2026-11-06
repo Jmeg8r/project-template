@@ -70,6 +70,14 @@ Usage:
   bin/blast-radius.py --json --changed-from BASE --declare-generated
                                                # as review-pr.sh calls it: may report a
                                                # compiled viewer as a declared exclusion
+  bin/blast-radius.py --jsonl-digest BASE HEAD DECL < path/status pairs (NUL-separated)
+                                               # review-pr.sh 1c: declared ledgers' digests
+  bin/blast-radius.py --not-applicable VERDICT N < standards (a JSON array)
+                                               # review-pr.sh 5: judge and render a verdict's
+                                               # per-standard not-applicable reasons
+  bin/blast-radius.py --unmatched VERDICT REQUEST
+                                               # review-pr.sh 5: re-judge and render findings
+                                               # that name no supplied file (CLAUDE.md 4.8)
 """
 from __future__ import annotations
 
@@ -102,6 +110,7 @@ import os
 import re
 import subprocess
 from collections import Counter
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 # Never read these as text, and never call them dependents.
@@ -1072,8 +1081,415 @@ def changed_files(root: Path, base: str) -> tuple[list[str], list[tuple[str, str
     return list(dict.fromkeys(paths)), renames
 
 
+# ---- JSONL digest: a second job, hosted here only for the kit's size limit ----------
+# review-pr.sh section 1c sends a DECLARED JSONL table as this digest in place of its raw
+# diff (the 2026-10-25 change folder under docs/changes/). This side reads the declaration,
+# applies every condition, and reports each path it did NOT digest and why; review-pr.sh
+# only sends and discloses what comes back. It lives in this file because
+# review-pr.sh must stay under the per-file cap that reviews its own install PR, and every
+# consumer's workflow already copies exactly these two scripts. It reads committed blobs
+# only, never the working tree, and shares nothing with the resolver above. It must never
+# name a real path, the declaration's included (review-pr.sh passes it): see the note on
+# example paths in the module docstring.
+#
+# The declaration is read from BASE, never the PR, and a PR that changes it digests
+# nothing, so no PR can declare its own exemption. One "<path><TAB><key>[,<key>...]" per
+# line; blank and # lines are ignored; one malformed line disables every digest.
+#
+# Edited and removed rows go IN FULL as -/+ lines, because an in-place edit is where the
+# table's accidents are. Appended rows go only as counts and per-field value tallies.
+# Rows are classified by RAW LINE TEXT per key, never by parsed values. Anything that is
+# not a keyed JSONL table raises LedgerError, and the caller sends the raw diff instead.
+LEDGER_MARKER = "LEDGER DIGEST (review-pr.sh): rows summarized by key, not a raw diff"
+LEDGER_ENUM_MAX = 12   # at most this many distinct values: each is listed with its count
+LEDGER_SHOWN_MAX = 80  # characters of one listed value before it is shortened
+LEDGER_FIELD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")  # a field name, and a declared key
+
+
+class LedgerError(Exception):
+    """A copy that cannot be digested: not a keyed JSONL table, or not readable."""
+
+
+def _no_constant(name: str) -> None:
+    raise ValueError(f"non-JSON constant {name}")
+
+
+def ledger_rows(text: str, keys: list[str], side: str) -> dict[str, tuple[str, dict]]:
+    """{key: (raw line, parsed object)} for one copy, or LedgerError naming the line."""
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    rows = {}
+    for n, raw in enumerate(lines, 1):
+        if raw == "":
+            raise LedgerError(f"{side}: line {n} is empty")
+        try:
+            obj = json.loads(raw, parse_constant=_no_constant, parse_float=Decimal)
+        except ValueError:
+            raise LedgerError(f"{side}: line {n} is not JSON") from None
+        # Valid JSON a Decimal cannot hold (1e9999999999999999999) is not a ValueError.
+        except InvalidOperation:
+            raise LedgerError(f"{side}: line {n} has a number out of range") from None
+        if not isinstance(obj, dict):
+            raise LedgerError(f"{side}: line {n} is not a JSON object")
+        # Field names are printed into the digest as they are, so only plain ones: a newline
+        # in one could forge digest lines (review of 2026-10-26).
+        bad = [f for f in obj if not LEDGER_FIELD_RE.fullmatch(f)]
+        if bad:
+            raise LedgerError(f"{side}: line {n} has a field name that is not a plain "
+                              f"identifier: {json.dumps(bad[0])}")
+        parts = []
+        for k in keys:
+            v = obj.get(k)
+            # bool is an int in Python, so a true/false key is not a key. Nor is a float: 1 and
+            # 1.0 would get different identities, turning an edit into removed plus appended.
+            if isinstance(v, bool) or not isinstance(v, (str, int)):
+                raise LedgerError(f"{side}: line {n} has no string or integer in key field {k}")
+            parts.append(json.dumps(v))
+        key = "\x01".join(parts)
+        if key in rows:
+            raise LedgerError(f"{side}: duplicate key {','.join(parts)}")
+        rows[key] = (raw, obj)
+    return rows
+
+
+def _canonical_json(v: object) -> str:
+    # A decimal is its text: as a float, 9007199254740992.0 and 9007199254740993.0 are one
+    # value, so an edit between them would read as no change (Codex review of PR #187).
+    if isinstance(v, Decimal):
+        return str(v)
+    if isinstance(v, dict):
+        return "{" + ",".join(json.dumps(k, ensure_ascii=False) + ":" + _canonical_json(v[k])
+                              for k in sorted(v)) + "}"
+    if isinstance(v, list):
+        return "[" + ",".join(_canonical_json(x) for x in v) + "]"
+    return json.dumps(v, ensure_ascii=False)
+
+
+def _shortened(s: str) -> str:
+    return s if len(s) <= LEDGER_SHOWN_MAX else f"{s[:LEDGER_SHOWN_MAX]}... ({len(s)} chars)"
+
+
+def ledger_digest(path: str, keys: list[str], base_text: str,
+                  head_text: str) -> tuple[str, tuple[int, int, int]]:
+    base = ledger_rows(base_text, keys, "merge base")
+    head = ledger_rows(head_text, keys, "reviewed commit")
+    added = [head[k][1] for k in sorted(head) if k not in base]
+    removed_lines = [base[k][0] for k in sorted(base) if k not in head]
+    modified_pairs = [(base[k], head[k]) for k in sorted(head)
+                      if k in base and base[k][0] != head[k][0]]
+    out = [LEDGER_MARKER, f"path: {path}", f"key: {','.join(keys)}",
+           f"rows: base {len(base)}, head {len(head)}",
+           f"appended {len(added)} (summarized below, row text NOT shown), "
+           f"modified {len(modified_pairs)}, removed {len(removed_lines)} (shown in full)"]
+    # Reordered rows or a lost final newline change no row, and would otherwise read as an
+    # empty change (review of 2026-10-26).
+    if base_text != head_text and not (added or removed_lines or modified_pairs):
+        out.append("no row changed, but the file did (row order, or the final newline)")
+    out += ["", f"modified rows ({len(modified_pairs)}):"]
+    for (braw, bo), (hraw, ho) in modified_pairs:
+        changed = [f for f in sorted(set(bo) | set(ho))
+                   if f not in bo or f not in ho or _canonical_json(bo[f]) != _canonical_json(ho[f])]
+        out += ["-" + braw, "+" + hraw, "  changed fields: "
+                + (", ".join(changed) or "none (the line text changed, no value did)")]
+    out += ["", f"removed rows ({len(removed_lines)}):"] + ["-" + r for r in removed_lines]
+    out += ["", f"appended rows ({len(added)}), per field:"]
+    added_fields = sorted({f for o in added for f in o})
+    for f in added_fields:
+        # A missing field is not a null: a reader that subscripts it fails on one.
+        absent = sum(f not in o for o in added)
+        nulls = sum(f in o and o[f] is None for o in added)
+        tally = Counter(_canonical_json(o[f]) for o in added if o.get(f) is not None)
+        line = f"  {f}: " + (f"{absent} absent, " if absent else "") + f"{nulls} null"
+        if not tally:
+            out.append(line)
+        elif len(tally) <= LEDGER_ENUM_MAX:
+            shown = [f"{_shortened(s)} x{c}"
+                     for s, c in sorted(tally.items(), key=lambda t: (-t[1], t[0]))]
+            out.append(f"{line}; {', '.join(shown)}")
+        else:
+            out.append(f"{line}, {len(tally)} distinct")
+    if added:
+        base_fields = {f for _, o in base.values() for f in o}
+        only_added = sorted(set(added_fields) - base_fields)
+        only_base = sorted(base_fields - set(added_fields))
+        out.append(f"fields only in appended rows: {', '.join(only_added) or 'none'}")
+        out.append(f"fields only in base rows: {', '.join(only_base) or 'none'}")
+    counts = (len(added), len(modified_pairs), len(removed_lines))
+    return "\n".join(out) + "\n", counts
+
+
+def _blob(root: Path, ref: str, path: str) -> bytes | None:
+    out = subprocess.run(["git", "-C", str(root), "show", f"{ref}:{path}"], capture_output=True)
+    return out.stdout if out.returncode == 0 else None
+
+
+def _mode(root: Path, ref: str, path: str) -> str | None:
+    out = subprocess.run(["git", "-C", str(root), "ls-tree", ref, "--", path],
+                         capture_output=True, text=True)
+    return out.stdout.split(" ", 1)[0] if out.returncode == 0 and out.stdout else None
+
+
+def ledger_plan(root: Path, base: str, head: str, decl: str,
+                changed: list[tuple[str, str]]) -> dict[str, list]:
+    """{skipped, digests} for review-pr.sh. `changed` is [(path, status)] as it sends them."""
+    skipped, digests, declared = [], [], {}
+    jsonl_count = sum(p.endswith(".jsonl") for p, _ in changed)
+    raw = _blob(root, base, decl)
+    if raw is None:
+        if jsonl_count:
+            skipped.append(f"no {decl} on {base}; {jsonl_count} .jsonl file(s) reviewed as raw diffs")
+        return {"skipped": skipped, "digests": digests}
+    for line in raw.decode("utf-8", "replace").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        cols = line.split("\t")
+        bad = ("not exactly one TAB" if len(cols) != 2
+               else "path does not end .jsonl" if not cols[0].endswith(".jsonl")
+               else "keys are not field names"
+               if not all(LEDGER_FIELD_RE.fullmatch(k) for k in cols[1].split(","))
+               else "path declared twice" if cols[0] in declared else "")
+        if bad:
+            skipped.append(f"{decl} on {base} is malformed ({bad}: {line!r}); nothing is digested")
+            return {"skipped": skipped, "digests": digests}
+        declared[cols[0]] = cols[1].split(",")
+    if any(p == decl for p, _ in changed):
+        skipped.append(f"this PR changes {decl} itself; nothing is digested")
+        return {"skipped": skipped, "digests": digests}
+    # Said, never passed over: a typo, a "./" prefix or a byte-order mark in the declaration
+    # would otherwise send a table as a raw diff with nothing pointing at why.
+    for path, _ in changed:
+        if path.endswith(".jsonl") and path not in declared:
+            skipped.append(f"{path} is not declared in {decl}; raw diff")
+    mb = subprocess.run(["git", "-C", str(root), "merge-base", base, head],
+                        capture_output=True, text=True)
+    if mb.returncode != 0:
+        skipped.append(f"no merge base with {base}; nothing is digested")
+        return {"skipped": skipped, "digests": digests}
+    for path, status in changed:
+        if path not in declared:
+            continue
+        if status != "modified":
+            skipped.append(f"{path} NOT digested (it is {status}, not modified); raw diff")
+            continue
+        # A digest compares contents only, so a mode change (identical blobs) would read as
+        # no change at all and never reach the model (Codex review of 0fd0fb9).
+        if _mode(root, mb.stdout.strip(), path) != _mode(root, head, path):
+            skipped.append(f"{path} NOT digested (its file mode changed); raw diff")
+            continue
+        old, new = _blob(root, mb.stdout.strip(), path), _blob(root, head, path)
+        try:
+            if old is None or new is None:
+                raise LedgerError("a copy could not be read")
+            text, counts = ledger_digest(path, declared[path],
+                                         old.decode("utf-8"), new.decode("utf-8"))
+        except UnicodeDecodeError:
+            skipped.append(f"{path} NOT digested (a copy is not UTF-8); raw diff")
+            continue
+        except RecursionError:
+            skipped.append(f"{path} NOT digested (a value is nested too deeply to read); raw diff")
+            continue
+        except LedgerError as e:
+            skipped.append(f"{path} NOT digested ({e}); raw diff")
+            continue
+        digests.append({"path": path, "text": text, "appended": counts[0],
+                        "modified": counts[1], "removed": counts[2]})
+    return {"skipped": skipped, "digests": digests}
+
+
+def ledger_digest_cli(args: list[str]) -> int:
+    """--jsonl-digest BASE HEAD DECL, with NUL-separated path/status pairs on stdin:
+    the plan as JSON on stdout. Non-zero only when this side itself broke."""
+    if len(args) != 3:
+        sys.stderr.write("--jsonl-digest needs BASE HEAD DECL, path/status pairs on stdin\n")
+        return 2
+    fields = sys.stdin.buffer.read().decode("utf-8", "surrogateescape").split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    if len(fields) % 2:
+        sys.stderr.write("--jsonl-digest: stdin is not path/status pairs\n")
+        return 2
+    changed = list(zip(fields[0::2], fields[1::2]))
+    print(json.dumps(ledger_plan(repo_root(), args[0], args[1], args[2], changed)))
+    return 0
+
+
+# review-pr.sh section 5's fourth zero-standards exception (CLAUDE.md section 4.7; geekspace
+# forge PR #84, TOML and shell reviewed against rules about Electron and Convex). It lives
+# here, not in review-pr.sh, for the reason the digest above does: review-pr.sh must stay
+# under the per-file cap that reviews its own install PR (selftest case 19).
+# The bounds must match review-broker.py's NA_REASON_MIN_CHARS/MAX_CHARS by inspection.
+NA_REASON_MIN_CHARS = 12
+NA_REASON_MAX_CHARS = 300
+# How many standards are NAMED in the comment, as review-pr.sh's STD_LABEL_CAP; the rest
+# are counted. Each label keeps this many characters of the standard's text.
+NA_LABEL_CAP = 200
+NA_LABEL_CHARS = 100
+# Every control character and Unicode line separator becomes a space, so a label or reason
+# stays one blockquote line and cannot forge a line forge-pr parses.
+_NA_BREAKS = {c: " " for c in [*range(32), 127, 133, 0x2028, 0x2029]}
+
+
+def _na_text(value: object) -> str:
+    return str(value).translate(_NA_BREAKS)
+
+
+def not_applicable_problem(rows: object, n: int) -> str | None:
+    """Why `rows` does NOT say, for every one of `n` standards, that it does not apply and
+    why; None when it does. The broker applies the same rules (_not_applicable_problem); this
+    copy is the client's, so a broker field is never trusted. Each standard 1..n exactly
+    once, `applies` exactly false, a reason NA_REASON_MIN..MAX characters once trimmed, and
+    no reason shared by two standards once case and whitespace are folded: one sentence
+    pasted onto every rule is not a judgement about any of them."""
+    if not isinstance(rows, list) or not rows:
+        return "the verdict carries no standards_not_applicable list"
+    if n <= 0 or len(rows) != n:
+        return f"the list answers {len(rows)} standard(s) of {n}"
+    seen: set = set()
+    reasons: set = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            return "an entry is not an object"
+        num, reason = row.get("standard"), row.get("reason")
+        if isinstance(num, bool) or not isinstance(num, int) or not 1 <= num <= n or num in seen:
+            return f"standard number {num!r} is out of range or repeated"
+        seen.add(num)
+        if row.get("applies") is not False:
+            return f"standard {num} is not marked as not applicable"
+        if not isinstance(reason, str):
+            return f"standard {num}: the reason is not text"
+        text = reason.strip()
+        if not NA_REASON_MIN_CHARS <= len(text) <= NA_REASON_MAX_CHARS:
+            return (f"standard {num}: a reason of {len(text)} character(s), expected "
+                    f"{NA_REASON_MIN_CHARS}..{NA_REASON_MAX_CHARS}")
+        folded = " ".join(text.casefold().split())
+        if folded in reasons:
+            return f"standard {num}: the same reason is given for another standard"
+        reasons.add(folded)
+    return None
+
+
+def not_applicable_cli(args: list[str]) -> int:
+    """--not-applicable VERDICT N, the standards this client sent on stdin as a JSON array.
+    Exit 0 with the comment's blockquote on stdout when VERDICT's standards_not_applicable
+    is acceptable; exit 1 with the reason on stderr when it is not; 2 on bad usage."""
+    if len(args) != 2 or not args[1].isdigit():
+        sys.stderr.write("--not-applicable needs VERDICT N, the standards on stdin\n")
+        return 2
+    n = int(args[1])
+    try:
+        standards = json.loads(sys.stdin.read())
+        verdict = json.loads(Path(args[0]).read_text())
+    except (OSError, ValueError) as e:
+        sys.stderr.write(f"   not-applicable list: unreadable ({e})\n")
+        return 1
+    if not isinstance(standards, list) or len(standards) != n or not isinstance(verdict, dict):
+        sys.stderr.write(f"   not-applicable list: expected {n} standards and a verdict object\n")
+        return 1
+    rows = verdict.get("standards_not_applicable")
+    problem = not_applicable_problem(rows, n)
+    if problem is not None:
+        why = verdict.get("standards_applicability_problem")
+        sys.stderr.write(f"   not-applicable list refused: {problem}"
+                         + (f" (broker: {_na_text(why)[:300]})" if why else "") + "\n")
+        return 1
+    labels = [f"> > - ({r['standard']}) {_na_text(standards[r['standard'] - 1])[:NA_LABEL_CHARS]}"
+              f" → {_na_text(r['reason']).strip()}"
+              for r in sorted(rows, key=lambda r: r["standard"])[:NA_LABEL_CAP]]
+    if n > NA_LABEL_CAP:
+        labels.append(f"> > - …and {n - NA_LABEL_CAP} more, not listed here")
+    sys.stdout.write(
+        "> ℹ️ No standard applies: **no project standard was applied**. The model named "
+        f"none of the {n} standards as checked, and when asked about each one it judged it "
+        "not applicable to this change, for the reason given. This pass means the change "
+        "was read and nothing was flagged. It is not a rule check: read the reasons.\n>\n"
+        + "\n".join(labels) + "\n\n")
+    return 0
+
+
+def _json_type(v: object) -> str:
+    """The value's JSON type, named as jq's `type` names it."""
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "boolean"
+    if isinstance(v, (int, float)):
+        return "number"
+    return {str: "string", list: "array", dict: "object"}.get(type(v), type(v).__name__)
+
+
+def _one_line(v: object) -> str:
+    return (v if isinstance(v, str) else json.dumps(v)).replace("\n", " ").replace("`", "'")
+
+
+def unmatched_cli(args: list[str]) -> int:
+    """--unmatched VERDICT REQUEST: the findings the broker marked `unmatched_file`, whose
+    `file` is no changed or blast-radius path of REQUEST, are kept out of the verdict
+    (CLAUDE.md section 4.8). Exit 0 with the comment's disclosure of them on stdout (empty
+    when there are none); exit 1 when `findings` is not a list of objects, or when a mark
+    sits on a path REQUEST did supply, because then the verdict left a real finding out and
+    cannot be trusted; 2 on bad usage."""
+    if len(args) != 2:
+        sys.stderr.write("--unmatched needs VERDICT REQUEST\n")
+        return 2
+    try:
+        verdict, req = (json.loads(Path(a).read_text()) for a in args)
+        supplied = {str(f["path"]) for key in ("changed", "context")
+                    for f in req.get(key) or [] if isinstance(f, dict) and f.get("path")}
+        findings = verdict.get("findings")
+        # The gate's only check of the findings shape; review-pr.sh calls this before jq
+        # counts them, because jq's length reads a missing or null findings as 0 and a
+        # string as its character count (geekspace #102, comment 29377). Here, not in
+        # review-pr.sh, because that script is at its own DIFF_CAP (selftest
+        # "installability"). A non-object entry is refused too, never skipped.
+        if "findings" not in verdict:
+            problem = "findings absent"
+        elif not isinstance(findings, list):
+            problem = f"findings is {_json_type(findings)}"
+        else:
+            problem = next((f"findings has an entry of type {_json_type(f)}" for f in findings
+                            if not isinstance(f, dict)), None)
+        if problem:
+            sys.stderr.write(f"   broker verdict malformed: {problem}, expected a list of "
+                             "finding objects\n")
+            return 1
+    except (OSError, ValueError, AttributeError) as e:
+        sys.stderr.write(f"   unmatched findings: unreadable ({e})\n")
+        return 1
+    marked = [f for f in findings if f.get("unmatched_file") is True]
+    wrong = sorted({f["file"] for f in marked if isinstance(f.get("file"), str)
+                    and f["file"] in supplied})
+    if wrong:
+        sys.stderr.write(f"   broker marked a finding on {', '.join(wrong)} as naming no "
+                         "supplied file, but this request supplied it: the verdict left it "
+                         "out, so it cannot be trusted\n")
+        return 1
+    stale = sum(1 for f in findings if f.get("unmatched_file") is not True
+                and not (isinstance(f.get("file"), str) and f["file"] in supplied))
+    if stale:
+        sys.stderr.write(f"   NOTE: {stale} finding(s) name no supplied file but are unmarked "
+                         "and counted: the broker predates CLAUDE.md 4.8\n")
+    if not marked:
+        return 0
+    sys.stderr.write(f"   unmatched findings: {len(marked)}, shown apart and not counted\n")
+    sys.stdout.write(
+        f"\n> **Not counted toward the verdict**: {len(marked)} finding(s) name no file this "
+        "review was given (neither a changed file nor a dependent), so they cannot describe "
+        "what this change did. Shown so nothing the model said is hidden:\n>\n"
+        + "\n".join(f"> - `{_one_line(f.get('file'))}` — {_one_line(f.get('severity'))} / "
+                     f"{_one_line(f.get('category'))}: {_one_line(f.get('summary'))}"
+                     for f in marked) + "\n")
+    return 0
+
+
 def main() -> int:
     args = sys.argv[1:]
+    if args and args[0] == "--jsonl-digest":
+        return ledger_digest_cli(args[1:])
+    if args and args[0] == "--not-applicable":
+        return not_applicable_cli(args[1:])
+    if args and args[0] == "--unmatched":
+        return unmatched_cli(args[1:])
     as_json = "--json" in args
     declare_generated = "--declare-generated" in args
     args = [a for a in args if a not in ("--json", "--declare-generated")]
