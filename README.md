@@ -101,8 +101,15 @@ flowchart TD
     PR --> CI["CI: script syntax,<br/>Semgrep, Gitleaks"]
 ```
 
-A rendered diagram is in [`docs/diagrams/project-template.architecture.svg`](docs/diagrams/project-template.architecture.svg)
-(source: `docs/diagrams/project-template.architecture.json`).
+<!-- archify:begin -->
+### System map
+
+![System map](docs/diagrams/project-template.architecture.svg)
+
+Interactive: [`docs/diagrams/project-template.architecture.html`](docs/diagrams/project-template.architecture.html)
+— search, trace routes, compare roles. Source of truth is the typed IR
+[`project-template.architecture.json`](docs/diagrams/project-template.architecture.json); edit that, never the HTML.
+<!-- archify:end -->
 
 ## Project Structure
 
