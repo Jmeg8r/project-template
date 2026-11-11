@@ -15,26 +15,13 @@ THE FAILURE MODE THIS GUARDS AGAINST
       Every run states how many files it scanned.
 
 A NOTE ON THE EXAMPLE PATHS BELOW
-      Every illustrative filename below carries an angle-bracketed segment --
-      `<dir>/<name>.ts`, never a plausible real path. That is a rule about the whole
-      class, not a patch on one example. This file deploys byte-identical into
-      consuming repos and matches other files by LITERAL REFERENCE, so any path or
-      basename spelled out here makes THIS file a permanent phantom dependent of the
-      real file that happens to bear that name -- the same inflation the basename rule
-      below exists to prevent, self-inflicted, shipped to every consumer.
-      Spelling the examples out as full `src/`-rooted paths did exactly that to four
-      real files in mcp-techkb. Shortening them by one leading segment only moved the
-      problem to a repo laid out that way (Codex [P2] on PR #45) -- which is why the
-      rule is a placeholder FORM and not a shorter path. No tracked file is named with
-      angle brackets, so nothing in these examples can match one. This paragraph obeys
-      its own rule: it describes those paths rather than spelling them.
-      Measured, not asserted: a repo carrying one real file per basename-shaped token
-      in this file produces zero phantoms for every plausible source name. Two matches
-      survive and are deliberate. A file named exactly `.d.ts` hits the extension
-      constants, which cannot be spelled any other way; and a SECOND file named like
-      this one hits the usage block via the bare Python stem token, which the deployed
-      copy never triggers because a file is excluded from its own dependents. Neither
-      is a name a real tree carries.
+      Every illustrative filename carries an angle-bracketed segment (`<dir>/<name>.ts`),
+      never a plausible real path or config name. This file deploys byte-identical and
+      matches by LITERAL REFERENCE, so a real-looking name here makes it a phantom
+      dependent of the real file bearing it: four files in mcp-techkb, and a shorter
+      path only moved the problem (Codex [P2] on PR #45). Measured: one real file per
+      basename-shaped token here yields no phantom except a file named exactly `.d.ts`
+      and a second copy of this script, which no real tree carries.
 
 MATCHING
       Python imports are resolved structurally (module path -> importers).
@@ -48,6 +35,14 @@ MATCHING
       IMPORTER's own directory, not by rewriting the extension into another bare token:
       a sibling `'./<name>.js'` is only unambiguous once you know which directory it
       sits in — this repo's consumers have two same-named modules under one src/ tree.
+      A non-relative specifier resolves through the `paths` and `baseUrl` of the
+      tsconfig/jsconfig files above the importer: content-repurposer writes 114 of 117
+      imports as `'@/<dir>/<name>'`, and the radius came back empty (Codex [P2],
+      2026-11-09). An alias config that cannot be read is UNKNOWN. See ts_configs().
+      Swift is resolved by the NAMES a file declares, because Swift has no per-file
+      import: a module's files use each other's declarations without naming the file, so
+      literal matching found zero dependents for a Swift type used in four other files
+      (noteclarity, Codex [P2], 2026-11-09). See swift_names().
       Everything else — shell, YAML, markdown, docs — is matched by literal reference to
       the file's path or basename, because in this repo a workflow referencing <dir>/<name>.sh
       or a runbook documenting it IS a dependent: change the flags and those break.
@@ -119,43 +114,10 @@ SKIP_SUFFIX = {".png", ".jpg", ".jpeg", ".gif", ".pdf", ".zip", ".docx", ".xlsx"
 MAX_FILE_BYTES = 512_000
 
 # The ONE generated artifact the sweep may set aside rather than call unreadable: the
-# compiled diagram viewer /doco-refresh commits beside its JSON source, as
-# <name>.architecture.html and <name>.architecture.json under the directory below. The
-# viewer is ~700 KB in every repo that tracks one (33 on the forge, 710-724 KB, measured
-# 2026-10-10), so it was over MAX_FILE_BYTES on every run and the INCOMPLETE warning
-# became permanent in ten consumers -- a warning that never changes hides the unreadable
-# file that matters. Same shape and same reasoning as review-pr.sh section 1b.
-#
-# Two conditions, BOTH required, and the second is the load-bearing one:
-#   1. the path has this prefix and this suffix AND the sweep could not read it (a viewer
-#      it CAN read is searched like any other file);
-#   2. the sibling source was read and searched in this same run, or is itself a readable
-#      changed target -- in which case it is not searched (no changed file is) but is
-#      reviewed directly. An absent, oversized or undecodable source stands in for nothing.
-# Without (2) this is a blanket exemption for a path shape. Excluded files are DECLARED --
-# on the console and in the JSON -- never dropped: an undeclared exclusion reads as
-# "searched everything".
-#
-# OPT-IN, per call (--declare-generated). The two kit scripts are redeployed as a pair but
-# do drift apart: a consumer can hold this resolver beside a review-pr.sh that predates
-# `generated_excluded`. That gate reads only `unreadable`, so a viewer moved out of it
-# would vanish from the comment while the comment claimed a complete sweep -- declared
-# nowhere a reader looks. So the caller must say it can disclose an exclusion; without the
-# flag every viewer is unreadable, exactly as before. An OLDER resolver ignores the flag
-# (it reads nothing after the base ref), so the new gate is safe beside it too.
-#
-# Path characters are ALLOWLISTED, here and identically in review-pr.sh, because excluded
-# paths are printed into the comment forge-pr parses. A tracked path may hold a newline,
-# a backtick or a Unicode line separator; such a viewer is never excluded and stays
-# merely unreadable, which is advisory, rather than stopping the gate on every PR.
-#
-# THREAT MODEL: private single-owner repos; the adversary is an owner ACCIDENT, not a
-# contributor hiding a file from review. A hand-written file placed at this path shape
-# beside a small JSON would leave the sweep, declared in every comment. Accepted.
-#
-# The source stands in because the viewer is a constant runtime plus that JSON. Measured
-# with this file's own token rules on four consumers: every target the viewer matched,
-# the source matched too (0 viewer-only matches). Re-measured per consumer at redeploy.
+# ~700 KB compiled diagram viewer under the directory below, and only when its sibling
+# JSON source was searched in this run (or is a readable changed target). Opt-in per
+# call (--declare-generated), declared, and path characters allowlisted as in
+# review-pr.sh section 1b. Why: sovereign-forge docs/blast-radius-rationale.md#generated-viewer.
 GENERATED_VIEWER_DIR = "docs/diagrams/"
 GENERATED_VIEWER_SUFFIX = ".architecture.html"
 GENERATED_SOURCE_SUFFIX = ".architecture.json"
@@ -169,49 +131,26 @@ JS_FAMILY_SUFFIX = {".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"
 # is imported by the same name as the module it describes, so resolving one direction
 # without the other reports zero dependents for every changed stub.
 PY_FAMILY_SUFFIX = {".py", ".pyi"}
+# A Swift declaration at the start of a line: attributes, then modifiers (group 1), the
+# keyword (group 2) and the declared name (group 3). See swift_names().
+SWIFT_SUFFIX = ".swift"
+SWIFT_DECL_RE = re.compile(
+    r"(?:@[\w.]+(?:\([^)\n]*\))?\s+)*((?:[a-z]+(?:\([a-z]+\))?\s+)*)"
+    r"(class|struct|enum|protocol|actor|typealias|func|let|var|extension)\s+"
+    r"`?([A-Za-z_][A-Za-z0-9_]*)")
+# Visible only inside the declaring file, so no other file can be its dependent.
+SWIFT_FILE_PRIVATE = {"private", "fileprivate"}
+# git ls-tree's mode for a symlink, which is never read (see readable_text).
+SYMLINK_MODE = "120000"
 # A module named by a STRING at a loader call rather than by the import grammar. The
 # quotes make the name unambiguous at ANY length, which is what makes this the right
 # route for a name too short for word_token's floor -- lowering that floor instead was
 # measured and is not viable: word-boundary "re" hits 16 of 30 tracked files here and
 # "db" 19 of 50 in mcp-techkb.
 DYNAMIC_IMPORT_CALLS = {"import_module", "__import__"}
-# Which loader each MODULE provides, and therefore which `<ns>.<attr>` spellings name
-# one. A table over the whole input domain rather than an equality check on a single
-# spelling: `<ns>.__import__` was rejected outright, so an importer of a one- or
-# two-character module written that way disappeared entirely -- the name is below
-# word_token's floor and the literal tokens hold only the filename, so the target
-# reported ZERO dependents, the exact failure this resolver exists to prevent (Codex
-# [P2] on mcp-techkb PR #18, 2026-08-29).
-#
-# `importlib.__import__` is in here because it EXISTS -- verified against the
-# interpreter: present, same five-argument signature, and it really imports. Codex
-# named only the `builtins` spelling; the same miss in code that already imports
-# importlib is the other half of the same class, and fixing the reported instance
-# alone would have left it.
-#
-# DELIBERATELY NOT ACCEPTED, all three for the same reason -- there is no BINDING to
-# check, only a value to track:
-#   getattr(<ns>, "__import__")     a computed attribute name, which is the answer
-#                                   this resolver already gives every computed name
-#                                   (an interpolated JS specifier, import_module(f())).
-#   <ns>.__dict__["__import__"],    subscripts of an opaque container; resolving them
-#   sys.modules["builtins"].…       is value-flow analysis, the same class of tool
-#                                   _loader_bindings already declines for scope.
-#   __builtins__.__import__         verified against the interpreter: `__builtins__`
-#                                   is a DICT in any imported module and a module only
-#                                   in __main__, so outside a directly-run script that
-#                                   spelling is an AttributeError, not an import. It is
-#                                   also a CPython implementation detail no import
-#                                   statement ever binds, so nothing could be proven
-#                                   about it even in the case where it works.
-#
-# SELF-REFERENCE, measured not assumed: the key "builtins" is a word_token match, so a
-# repo file named builtins.py now counts THIS file as a dependent where it did not
-# before (measured: PRE [] -> POST [bin/blast-radius.py]). Accepted, and already the
-# documented policy -- importlib.py, ast.py and json.py have the same property today
-# for the same reason, and word_token below states why a stem shadowing a preloaded
-# stdlib module is knowingly not excluded. The name cannot be spelled any other way
-# without making the binding check unreadable, and the direction is over-report.
+# Which loader each MODULE provides, so which `<ns>.<attr>` spellings name one. A table,
+# not one spelling (Codex [P2] on mcp-techkb PR #18). Computed names, opaque subscripts
+# and `__builtins__` are refused on purpose. Why: sovereign-forge docs/blast-radius-rationale.md#loader-module-table.
 LOADER_MODULE_ATTRS = {
     "importlib": frozenset({"import_module", "__import__"}),
     "builtins": frozenset({"__import__"}),
@@ -252,6 +191,19 @@ REL_SPEC_RE = re.compile(r"""(['"`])(\.\.?(?:/[^'"`\n]*)?)\1""")
 # A template literal with an interpolation resolves to nothing at rest, so there is no
 # path to check -- skip rather than invent one out of the literal `${...}` text.
 INTERPOLATION = "${"
+# Alias config files, matched by SHAPE: spelling the root one's name here would make this
+# file its literal dependent (see the note on example paths).
+TS_CONFIG_RE = re.compile(r"(?:ts|js)config(?:\.[^/]+)?\.json")
+TS_CONFIG_DIR = "${configDir}"
+# Alias importers. Single-file components hold ordinary import lines, so the quoted-
+# string scan reaches them without a parser.
+ALIAS_IMPORTER_SUFFIX = JS_FAMILY_SUFFIX | {".vue", ".svelte", ".astro", ".mdx"}
+# A quoted string that could be a non-relative specifier. The length cap bounds the work
+# a minified file can make.
+BARE_SPEC_RE = re.compile(r"""(['"`])([^'"`\s./][^'"`\s]{0,199})\1""")
+# JSONC: a string is matched first so a `//` or `/*` inside one survives.
+JSONC_RE = re.compile(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/', re.S)
+JSONC_COMMA_RE = re.compile(r'("(?:\\.|[^"\\])*")|,(?=\s*[}\]])')
 
 
 def repo_root() -> Path:
@@ -783,7 +735,13 @@ def resolve_js_specifier(importer_rel: str, spec: str, known: set[str]) -> set[s
     the caller only asks whether a target is among them, so guessing Node's precedence
     order wrong cannot produce a wrong answer, only a slightly wider one.
     """
-    joined = os.path.normpath(os.path.join(os.path.dirname(importer_rel), spec))
+    return _js_candidates(os.path.normpath(os.path.join(os.path.dirname(importer_rel), spec)),
+                          known)
+
+
+def _js_candidates(joined: str, known: set[str]) -> set[str]:
+    """The files a normalized repo-relative specifier path could name; shared by
+    relative specifiers and alias targets."""
     if joined == "." or joined == ".." or joined.startswith(".." + os.sep):
         # Climbs out of the repo. Empty is the correct answer, not a swallowed
         # failure: every target comes from this repo's own diff, so it is always a
@@ -813,9 +771,209 @@ def resolve_js_specifier(importer_rel: str, spec: str, known: set[str]) -> set[s
     return out
 
 
+def _jsonc(text: str):
+    text = JSONC_RE.sub(lambda m: m.group(1) or "", text.lstrip("﻿"))
+    return json.loads(JSONC_COMMA_RE.sub(lambda m: m.group(1) or "", text))
+
+
+def _ts_chain(root: Path, rel: str, tracked: set[str], alias_notes: list[str],
+              members: set[str], seen: tuple = ()) -> dict:
+    """{"paths"|"baseUrl": (value, defining dir)} for one config and what it extends; a
+    config replaces what it extends, never merging into it. Raises ValueError naming the config when it cannot be
+    read. An extends the sweep cannot read BY CONSTRUCTION (a package, or a gitignored
+    generated file) is a note, not a failure: James, 2026-11-09 (spec R7)."""
+    if rel in seen:
+        return {}
+    members.add(rel)
+    text = readable_text(root / rel)
+    try:
+        parsed = _jsonc(text) if isinstance(text, str) else None
+    except ValueError as e:
+        raise ValueError(f"{rel}: {e}") from None
+    copts = parsed.get("compilerOptions", {}) if isinstance(parsed, dict) else None
+    ext = parsed.get("extends", []) if isinstance(parsed, dict) else None
+    ext = [ext] if isinstance(ext, str) else ext
+    if not isinstance(copts, dict) or not isinstance(ext, list):
+        raise ValueError(f"{rel}: unreadable, or not a config object")
+    here, out = os.path.dirname(rel), {}
+    for e in ext:  # a later entry replaces an earlier one
+        if not isinstance(e, str):
+            raise ValueError(f"{rel}: extends {e!r}")
+        if not e.startswith((".", "/")):
+            alias_notes.append(f"{rel} extends package {e!r}, which the sweep does not resolve")
+            continue
+        p = os.path.normpath(os.path.join(here, e))
+        found = next((c for c in (p, p + ".json") if c in tracked), None)
+        if found:
+            out.update(_ts_chain(root, found, tracked, alias_notes, members, seen + (rel,)))
+        elif subprocess.run(["git", "-C", str(root), "check-ignore", "-q", p]).returncode == 0:
+            alias_notes.append(f"{rel} extends {e!r}, a gitignored file not in the repo")
+        else:
+            raise ValueError(f"{rel}: extends {e!r}, which is not a tracked file")
+    out.update({k: (copts[k], here) for k in ("paths", "baseUrl") if k in copts})
+    return out
+
+
+def _ts_config(root: Path, rel: str, tracked: set[str], alias_notes: list[str], members: set[str]):
+    """(alias_pats, base) for one config: alias_pats is [(prefix, suffix or None, [targets])],
+    a None suffix meaning an exact key; base is the baseUrl directory or None."""
+    m = _ts_chain(root, rel, tracked, alias_notes, members)
+    leaf_dir = os.path.dirname(rel)
+
+    def at(d: str, v: str) -> str:
+        if v.startswith(TS_CONFIG_DIR):
+            d, v = leaf_dir, v[len(TS_CONFIG_DIR):].lstrip("/")
+        return os.path.normpath(os.path.join(d, v))
+    burl, udir = m.get("baseUrl", (None, ""))
+    paths, pdir = m.get("paths", (None, ""))
+    if burl is not None and not isinstance(burl, str):
+        raise ValueError(f"{rel}: baseUrl is not a string")
+    base = at(udir, burl) if burl is not None else None
+    if not isinstance(paths or {}, dict):  # null is legal: set, and empty
+        raise ValueError(f"{rel}: paths is not an object")
+    alias_pats = []
+    for k, vals in (paths or {}).items():
+        if (not isinstance(vals, list) or k.count("*") > 1
+                or not all(isinstance(v, str) and v.count("*") <= 1 for v in vals)):
+            raise ValueError(f"{rel}: paths entry {k!r} is not a pattern and a list of targets")
+        pre, wild, suf = k.partition("*")
+        alias_pats.append((pre, suf if wild else None,
+                         [at(base if base is not None else pdir, v) for v in vals]))
+    return alias_pats, base
+
+
+_TS_CACHE: dict = {}
+
+
+def ts_configs(root: Path) -> tuple:
+    """(by_dir, bad_cfgs, alias_notes, cfg_readers), once per root: by_dir maps a config's directory to
+    the (alias_pats, base) of each config there; bad_cfgs maps a directory to why one of its
+    config files could not be read; cfg_readers maps every config and extends-cfg_readers file to the
+    directories whose config files read it."""
+    if root not in _TS_CACHE:
+        tracked = {str(f.relative_to(root)) for f in tracked_files(root)}
+        by_dir, bad_cfgs, alias_notes, cfg_readers = {}, {}, [], {}
+        for rel in sorted(r for r in tracked if TS_CONFIG_RE.fullmatch(os.path.basename(r))):
+            d, members = os.path.dirname(rel), set()
+            try:
+                by_dir.setdefault(d, []).append(_ts_config(root, rel, tracked, alias_notes, members))
+            except ValueError as e:
+                bad_cfgs.setdefault(d, str(e))
+            for x in members:
+                cfg_readers.setdefault(x, set()).add(d)
+        _TS_CACHE[root] = by_dir, bad_cfgs, alias_notes, cfg_readers
+    return _TS_CACHE[root]
+
+
+def resolve_js_alias(importer_rel: str, spec: str, by_dir: dict, known: set[str]) -> set[str]:
+    """Files a non-relative specifier could name through the `paths` and `baseUrl` of
+    every config in the importer's directory or above it. A union, not TypeScript's
+    nearest-config rule: wider is safe, and it reaches the config a Vite root lists
+    under `references`. Every matching key counts, not only the longest prefix."""
+    out, d = set(), os.path.dirname(importer_rel)
+    while True:
+        for alias_pats, base in by_dir.get(d, ()):
+            for pre, suf, vals in alias_pats:
+                if suf is None:
+                    found = spec == pre
+                else:
+                    found = (len(spec) >= len(pre) + len(suf)
+                           and spec.startswith(pre) and spec.endswith(suf))
+                if found:
+                    wild = "" if suf is None else spec[len(pre):len(spec) - len(suf)]
+                    for v in vals:
+                        out |= _js_candidates(os.path.normpath(v.replace("*", wild)), known)
+            if base is not None:
+                out |= _js_candidates(os.path.normpath(os.path.join(base, spec)), known)
+        if not d:
+            return out
+        d = os.path.dirname(d)
+
+
+def swift_names(text: str) -> set[str]:
+    """The names a .swift file declares for OTHER files to use: its non-private top-level
+    declarations, plus the members of its top-level extensions.
+
+    An extension's own type name is deliberately not one: `extension String` would make
+    every file that says String a dependent, so an extension is found by the members it
+    adds. Line-based and keyed on indentation rather than a parser, so a missed name
+    under-reports; a file that yields no name at all is reported unresolved by main(),
+    never as having no dependents. Names of 1-2 characters are dropped for the reason
+    word_token gives.
+    """
+    names: set[str] = set()
+    member = None  # inside a top-level extension: its members' indent once seen, else -1
+    for line in text.splitlines():
+        body = line.lstrip()
+        if not body or body.startswith(("//", "/*", "*", "#")):
+            continue
+        indent = len(line) - len(body)
+        m = SWIFT_DECL_RE.match(body)
+        if indent == 0:
+            member = -1 if m and m.group(2) == "extension" else None
+            if member is not None:
+                continue
+        elif member is None or not m or member not in (-1, indent):
+            continue
+        else:
+            member = indent
+        if m and not SWIFT_FILE_PRIVATE & set(m.group(1).split()):
+            names.add(m.group(3))
+    return {n for n in names if len(n) > 2}
+
+
+def base_swift_names(root: Path, mb: str | None, rel: str):
+    """Names rel declared at merge-base mb: a set (empty when the change added it), or
+    SKIPPED when it was present there but could not be read as text."""
+    if mb is None:
+        return SKIPPED
+    mode = _mode(root, mb, rel)
+    if mode is None or mode == SYMLINK_MODE:
+        return set()
+    raw = _blob(root, mb, rel)
+    if raw is None or len(raw) > MAX_FILE_BYTES:
+        return SKIPPED
+    try:
+        return swift_names(raw.decode("utf-8", errors="strict"))
+    # UnicodeError, not UnicodeDecodeError: a test mutates that literal and needs it once.
+    except UnicodeError:
+        return SKIPPED
+
+
+def swift_patterns(root: Path, targets: list[str], base: str | None = None) -> dict:
+    """Each .swift target's declared names as one whole-word pattern, or None when they
+    could not be read (deleted with no base, unreadable, or declaring nothing nameable).
+
+    Given a base, the names the target declared at the merge-base count too: a PR that
+    renames or removes a declaration breaks the callers of the OLD name, which only the
+    base still declares (noteclarity PR 21, Codex [P2], 2026-11-09). The merge-base, not
+    the base ref itself, because changed_files diffs base...HEAD. A base copy that is
+    present but cannot be read hides the old names, so the target is None."""
+    mb = None
+    if base is not None:
+        r = subprocess.run(["git", "-C", str(root), "merge-base", base, "HEAD"],
+                           capture_output=True, text=True)
+        mb = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+    out = {}
+    for t in targets:
+        if Path(t).suffix != SWIFT_SUFFIX:
+            continue
+        text = readable_text(root / t)
+        names = swift_names(text) if isinstance(text, str) else set()
+        old = base_swift_names(root, mb, t) if base is not None else set()
+        if text is SKIPPED or old is SKIPPED:
+            names = set()
+        else:
+            names |= old
+        out[t] = (re.compile(r"(?<![A-Za-z0-9_])(?:" + "|".join(map(re.escape, sorted(names)))
+                             + r")(?![A-Za-z0-9_])") if names else None)
+    return out
+
+
 def find_dependents(root: Path, targets: list[str],
                     rename_pairs: list[tuple[str, str]] | None = None,
-                    declare_generated: bool = False
+                    declare_generated: bool = False,
+                    swift_map: dict | None = None
                     ) -> tuple[dict, int, list[str], list[tuple[str, str]]]:
     """Returns (dependents_by_target, files_scanned, scan_errors, generated_excluded).
 
@@ -849,6 +1007,7 @@ def find_dependents(root: Path, targets: list[str],
     # Tracked files plus the targets: a DELETED target is absent from ls-files, and a
     # specifier naming it should still terminate rather than expand into inventions.
     known_paths = tracked_rels | target_set
+    ts_dirs, alias_memo = ts_configs(root)[0], {}
     token_map = {t: literal_tokens(t, basename_counts) for t in targets}
     form_map = {t: module_dotted_forms(t) for t in targets}
     # Bare module names are matched on word boundaries, compiled once per target rather
@@ -864,6 +1023,12 @@ def find_dependents(root: Path, targets: list[str],
     # targets stay exact; only package targets match by prefix.
     pkg_map = {t: Path(t).stem == "__init__" and Path(t).suffix in PY_FAMILY_SUFFIX
                for t in targets}
+    # Searched in EVERY tracked .swift file, not just the target's module: membership
+    # lives in an Xcode project or Package.swift, and a test target that says
+    # `@testable import <Module>` reaches that module's names from outside it.
+    # Over-reporting is the safe direction (see word_token).
+    if swift_map is None:
+        swift_map = swift_patterns(root, targets)
     deps: dict[str, set] = {t: set() for t in targets}
     scanned, errors = 0, []
     # Paths that were actually read and searched, and unreadable viewers waiting on them.
@@ -904,6 +1069,12 @@ def find_dependents(root: Path, targets: list[str],
                 if INTERPOLATION in spec:
                     continue
                 resolved |= resolve_js_specifier(rel, spec, known_paths)
+        if ts_dirs and f.suffix.lower() in ALIAS_IMPORTER_SUFFIX:
+            for _quote, spec in BARE_SPEC_RE.findall(text):
+                key = (os.path.dirname(rel), spec)  # the governing config files depend on the directory only
+                if INTERPOLATION not in spec and key not in alias_memo:
+                    alias_memo[key] = resolve_js_alias(rel, spec, ts_dirs, known_paths)
+                resolved |= alias_memo.get(key, set())
         # AST imports for a .py dependent, resolved once per FILE like the JS
         # specifiers above. None when the file will not parse, in which case the
         # literal check below is the only signal -- the conservative fallback.
@@ -911,6 +1082,8 @@ def find_dependents(root: Path, targets: list[str],
                    if f.suffix in PY_FAMILY_SUFFIX else None)
         for t, tokens in token_map.items():
             wrx = word_map.get(t)
+            if wrx is None and f.suffix == SWIFT_SUFFIX:
+                wrx = swift_map.get(t)
             named = (t in resolved or any(tok in text for tok in tokens)
                      or (wrx is not None and wrx.search(text) is not None))
             imported = imports is not None and _py_match(form_map[t], pkg_map[t], imports)
@@ -1495,11 +1668,13 @@ def main() -> int:
     args = [a for a in args if a not in ("--json", "--declare-generated")]
     root = repo_root()
 
+    base = None
     if args and args[0] == "--changed-from":
         if len(args) < 2:
             sys.stderr.write("--changed-from needs a base ref\n")
             return 2
-        targets, rename_pairs = changed_files(root, args[1])
+        base = args[1]
+        targets, rename_pairs = changed_files(root, base)
         if not targets:
             sys.stderr.write(f"FATAL: no files changed vs {args[1]} — nothing to review\n")
             return 1
@@ -1516,24 +1691,12 @@ def main() -> int:
                          f"       that cannot find a string it was told is there is broken.\n")
         return 1
 
+    swift_map = swift_patterns(root, targets, base)
     deps, scanned, scan_errors, excluded = find_dependents(
-        root, targets, rename_pairs, declare_generated)
-    # The third return value used to be discarded into `_`: files the sweep could not
-    # read looked exactly like files with no dependents. They are now counted, named on
-    # the console, and carried in the JSON as `unreadable`, so a partial sweep is
-    # legible instead of silent.
-    #
-    # REPORTED, NOT FATAL — deliberately, and this is the one place this port departs
-    # from the claude-memory copy it came from. That copy exits 1 here, on the correct
-    # principle that an incomplete radius is UNKNOWN. It gets away with it because it is
-    # deployed in exactly one repo, which happens to track no oversized or undecodable
-    # file. Measured across the six repos this kit actually deploys into, that policy
-    # hard-fails TWO of them on their current main: claudeclaw
-    # (benchmark/longmemeval/data/longmemeval_oracle_slim.json, over the 512,000-byte
-    # cap) and geekspace (build/icon.icns, a binary suffix not in SKIP_SUFFIX). A gate
-    # that fails every run in a repo is one that gets routed around, which costs more
-    # than the partial scan it was refusing. Escalating this to fatal is a real
-    # improvement, but it needs those two files triaged first, not a flag day.
+        root, targets, rename_pairs, declare_generated, swift_map)
+    # Unreadable files are counted, named, and carried as `unreadable` -- REPORTED, NOT
+    # FATAL, so a repo that holds one oversized or binary file is not bad_cfgs on every run.
+    # Why: sovereign-forge docs/blast-radius-rationale.md#unreadable-not-fatal.
     if scan_errors:
         shown = ", ".join(sorted(scan_errors)[:5])
         more = "" if len(scan_errors) <= 5 else f" (+{len(scan_errors) - 5} more)"
@@ -1555,12 +1718,43 @@ def main() -> int:
         sys.stderr.write("FATAL: control passed but the sweep scanned 0 files — UNKNOWN, "
                          "not 'no dependents'.\n")
         return 1
+    # A Swift target with no readable declared name had no dependent searched for by name:
+    # UNKNOWN, not empty. It joins `unreadable`, which review-pr.sh already counts as an
+    # incomplete sweep, so the gate drops its all-clear without a client change.
+    unresolved = sorted(t for t, rx in swift_map.items() if rx is None)
+    if unresolved:
+        sys.stderr.write(
+            f"WARNING: no Swift declaration could be read from {', '.join(unresolved)}, so "
+            f"its dependents were never searched by name; this blast radius is INCOMPLETE, "
+            f"not proven empty.\n")
+    # Alias config files (spec R8, R10). One that cannot be read, or one this PR changed (its
+    # OLD aliases are never read), leaves every target under its directory UNKNOWN, by
+    # the same route as the Swift case above.
+    _dirs, bad_cfgs, alias_notes, cfg_readers = ts_configs(root)
+    why = dict(bad_cfgs)
+    for t in targets:
+        # A DELETED config is read by no live one; its own directory is what it governed.
+        shaped = TS_CONFIG_RE.fullmatch(os.path.basename(t))
+        for d in cfg_readers.get(t) or ([os.path.dirname(t)] if shaped else []):
+            why.setdefault(d, f"{t} is a changed alias config whose old aliases were not read")
+    for d, reason in sorted(why.items()):
+        found = [t for t in targets if not d or t.startswith(d + "/")]
+        if found:
+            unresolved = sorted(set(unresolved) | set(found))
+            sys.stderr.write(f"WARNING: {reason}; imports through its aliases were never "
+                             f"matched, so the radius of {', '.join(found)} is INCOMPLETE, "
+                             f"not proven empty.\n")
+    alias_notes = sorted(set(alias_notes))
+    for n in alias_notes:
+        sys.stderr.write(f"NOTE: {n}; assumed to set no paths or baseUrl.\n")
     total = sorted({d for s in deps.values() for d in s})
 
     if as_json:
         print(json.dumps({
             "targets": targets, "files_scanned": scanned,
-            "unreadable": sorted(scan_errors),
+            "unreadable": sorted(set(scan_errors) | set(unresolved)),
+            "unresolved": unresolved,
+            "alias_notes": alias_notes,
             "generated_excluded": [{"path": v, "source": s} for v, s in sorted(excluded)],
             "control": control_msg,
             "dependents": {t: sorted(v) for t, v in deps.items()},
